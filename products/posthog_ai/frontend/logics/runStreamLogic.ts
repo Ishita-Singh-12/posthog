@@ -2317,6 +2317,13 @@ export interface runStreamLogicActions {
         record: PermissionRequestRecord
         replayedFromHistory: boolean
     }
+    loadTurnSuggestionLedger: (
+        taskId: string,
+        attempt?: number
+    ) => {
+        attempt: number
+        taskId: string
+    }
     markBootstrapResumeRun: (value: boolean) => {
         value: boolean
     }
@@ -2461,13 +2468,6 @@ export interface runStreamLogicActions {
     setTurnSuggestionLedger: (ledger: TurnSuggestionLedger) => {
         ledger: TurnSuggestionLedger
     }
-    loadTurnSuggestionLedger: (
-        taskId: string,
-        attempt?: number
-    ) => {
-        taskId: string
-        attempt: number
-    }
     sseConnecting: () => {
         value: true
     }
@@ -2525,7 +2525,8 @@ export interface runStreamLogicMeta {
             turnSuggestionLedger: TurnSuggestionLedger | null,
             turnSuggestionOutcomesHere: Record<number, string>,
             turnSuggestionAcceptedHere: number | null,
-            turnSuggestionsMuted: boolean
+            turnSuggestionsMuted: boolean,
+            bootstrappedTaskId: string | null
         ) => TurnSuggestion | null
         latestTurnTraceId: (threadItems: ThreadItem[]) => string | null
         threadItems: (foldedThread: FoldedThread, showDebugLogs: boolean) => ThreadItem[]
