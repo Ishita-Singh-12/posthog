@@ -210,8 +210,6 @@ export const productRoutes: Record<string, [string, string]> = {
     '/ai-enrichment/:label': ['AIEnrichment', 'aiEnrichment'],
     '/legal': ['LegalDocuments', 'legalDocuments'],
     '/legal/new/:type': ['LegalDocumentNew', 'legalDocumentNew'],
-    '/links': ['Links', 'links'],
-    '/link/:id': ['Link', 'link'],
     '/live-debugger': ['LiveDebugger', 'liveDebugger'],
     '/logs': ['Logs', 'logs'],
     '/logs/alerts/:id': ['LogsAlertDetail', 'logsAlertDetail'],
@@ -898,14 +896,6 @@ export const productConfiguration: Record<string, any> = {
         description: 'Generate a Business Associate Agreement or Data Processing Agreement for your organization.',
     },
     LegalDocumentNew: { name: 'New legal document', organizationBased: true, activityScope: 'LegalDocument' },
-    Links: {
-        name: 'Links',
-        projectBased: true,
-        activityScope: 'Link',
-        description: 'Start creating links for your marketing campaigns, referral programs, and more.',
-        iconType: 'link',
-    },
-    Link: { name: 'Link', projectBased: true, activityScope: 'Link' },
     LiveDebugger: {
         name: 'Live debugger',
         projectBased: true,
@@ -1574,8 +1564,6 @@ export const productUrls = {
     aiEnrichment: (label?: string): string => `/ai-enrichment${label ? `/${encodeURIComponent(label)}` : ''}`,
     legalDocuments: (): string => '/legal',
     legalDocumentNew: (type: 'BAA' | 'DPA'): string => `/legal/new/${type.toLowerCase()}`,
-    links: (): string => '/links',
-    link: (id: string): string => `/link/${id}`,
     liveDebugger: (): string => '/live-debugger',
     logs: (): string => '/logs',
     logsAlertDetail: (id: string, tab?: string): string =>
@@ -1883,14 +1871,6 @@ export const fileSystemTypes = {
         iconColor: ['var(--color-product-product-analytics-light)'],
         filterKey: 'insight',
     },
-    link: {
-        name: 'Link',
-        iconType: 'link' as FileSystemIconType,
-        href: (ref: string) => urls.link(ref),
-        iconColor: ['var(--color-product-links-light)', 'var(--color-product-links-dark)'],
-        filterKey: 'link',
-        flag: FEATURE_FLAGS.LINKS,
-    },
     live_debugger: {
         name: 'Live Debugger',
         iconType: 'live_debugger',
@@ -2108,14 +2088,6 @@ export const getTreeItemsNew = (): FileSystemImport[] => [
         visualOrder: INSIGHT_VISUAL_ORDER.paths,
         sceneKeys: ['Insight'],
     },
-    {
-        path: `Link`,
-        type: 'link',
-        href: urls.link('new'),
-        iconType: 'link' as FileSystemIconType,
-        iconColor: ['var(--color-product-links-light)', 'var(--color-product-links-dark)'] as FileSystemIconColor,
-        flag: FEATURE_FLAGS.LINKS,
-    },
     { path: `Notebook`, type: 'notebook', href: urls.notebook('new'), iconType: 'notebook' },
     {
         path: `Product tour`,
@@ -2162,7 +2134,6 @@ export type ProductTreePath =
     | 'Heatmaps'
     | 'Identity matching'
     | 'Inbox'
-    | 'Links'
     | 'Live Debugger'
     | 'LLM analytics'
     | 'Logs'
@@ -2608,17 +2579,6 @@ export const getTreeItemsProducts = (): FileSystemImport[] => [
             'AIObservabilityClusters',
             'AIObservabilityCluster',
         ],
-    },
-    {
-        path: 'Links',
-        intents: [ProductKey.LINKS],
-        category: ProductItemCategory.UNRELEASED,
-        type: 'link',
-        href: urls.links(),
-        flag: FEATURE_FLAGS.LINKS,
-        tags: ['alpha'],
-        sceneKey: 'Links',
-        sceneKeys: ['Links', 'Link'],
     },
     {
         path: 'Live Debugger',
