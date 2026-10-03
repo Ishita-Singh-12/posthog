@@ -1,6 +1,11 @@
-"""Dagster job for deleting posthog_persons rows that have no associated posthog_persondistinctid rows."""
+"""Dagster job for tombstoning live posthog_person rows that have no associated posthog_persondistinctid rows.
+
+It publishes ClickHouse tombstones at the Postgres versions, so a re-created person revives above both, and
+leaves hard deletes to the Postgres drain (person_pg_cleanup_drain.py).
+"""
 
 import time
+from collections import defaultdict
 from typing import Any
 
 import dagster
@@ -11,6 +16,8 @@ from dagster_k8s import k8s_job_executor
 from posthog.clickhouse.cluster import ClickhouseCluster
 from posthog.clickhouse.custom_metrics import MetricsClient
 from posthog.dags.common import JobOwners
+from posthog.dataclasses import frozen
+from posthog.models.person.bulk_delete import resolve_persons_for_deletion, tombstone_and_publish_persons
 
 MAX_RETRY_ATTEMPTS = 5
 METRIC_PUBLISH_INTERVAL = 100
@@ -20,10 +27,29 @@ class PersonsNoDistinctIdsCleanupConfig(dagster.Config):
     """Configuration for the persons without distinct ids cleanup job."""
 
     chunk_size: int = 1_000_000  # ID range per chunk
-    batch_size: int = 1000  # Records to scan for a parent person or delete in a single transaction
+    batch_size: int = 1000  # Records to scan for a parent person or tombstone per batch
     max_id: int | None = None  # Optional override for max ID to resume from partial state
     min_id: int | None = None  # Optional override for min ID to resume from partial state
-    persons_table: str = "posthog_persons_new"  # Override once the table name swap is complete!
+    # The scan filters on is_deleted. The posthog_person_new compatibility view was created with
+    # SELECT * before that column existed, so the view does not expose it.
+    persons_table: str = "posthog_person"
+
+
+@frozen
+class OrphanTombstones:
+    tombstoned: int
+    skipped: int
+
+
+def tombstone_orphan_persons(team_id: int, person_uuids: list[str]) -> OrphanTombstones:
+    """Tombstone the scanned persons that still have no live distinct id.
+
+    A distinct id can attach after the scan, so the RPC re-checks under its person locks and spares such a person.
+    """
+    persons = resolve_persons_for_deletion(team_id, person_uuids, None)
+    orphans = [person for person in persons if not person.distinct_ids]
+    tombstoned = tombstone_and_publish_persons(team_id, orphans, skip_persons_with_distinct_ids=True) if orphans else 0
+    return OrphanTombstones(tombstoned=tombstoned, skipped=len(person_uuids) - tombstoned)
 
 
 @dagster.op
@@ -141,9 +167,8 @@ def scan_delete_chunk_for_pwdc(
     cluster: dagster.ResourceParam[ClickhouseCluster],
 ) -> dict[str, Any]:
     """
-    Scan posthog_person_new table for records that have no associated posthog_persondistinctid row,
-    and deletes the corresponding posthog_person_new row.
-    Processes in batches of batch_size records.
+    Tombstone the chunk's live persons that have no posthog_persondistinctid row, batch_size ids at a time.
+    Tombstoned rows stay untouched, because they hold the version floor a re-created person revives above.
     """
     chunk_min, chunk_max = chunk
     batch_size = config.batch_size
@@ -195,11 +220,11 @@ def scan_delete_chunk_for_pwdc(
                     # Begin transaction (settings already applied at session level)
                     cursor.execute("BEGIN")
 
-                    # Execute DELETE FROM posthog_person_new with NOT EXISTS check on
-                    # associated posthog_persondistinctid rows
-                    scan_delete_query = f"""
-DELETE FROM {config.persons_table} AS p
+                    scan_query = f"""
+SELECT p.team_id, p.uuid
+FROM {config.persons_table} AS p
 WHERE p.id >= %s AND p.id <= %s
+  AND NOT p.is_deleted
   AND NOT EXISTS (
     SELECT 1
     FROM posthog_persondistinctid AS pd
@@ -208,11 +233,20 @@ WHERE p.id >= %s AND p.id <= %s
   )
 ORDER BY p.id DESC
 """
-                    cursor.execute(scan_delete_query, (batch_start_id, batch_end_id))
-                    records_deleted = cursor.rowcount
+                    cursor.execute(scan_query, (batch_start_id, batch_end_id))
+                    uuids_by_team: dict[int, list[str]] = defaultdict(list)
+                    for row in cursor.fetchall():
+                        uuids_by_team[int(row["team_id"])].append(str(row["uuid"]))
 
-                    # Commit the transaction
+                    # Commit before the tombstone RPCs so no transaction stays open across them
                     cursor.execute("COMMIT")
+
+                    records_deleted = 0
+                    records_skipped = 0
+                    for team_id, uuids in uuids_by_team.items():
+                        result = tombstone_orphan_persons(team_id, uuids)
+                        records_deleted += result.tombstoned
+                        records_skipped += result.skipped
 
                     # Accumulate metrics locally
                     accumulated_records_attempted += records_scanned + 1
@@ -265,8 +299,8 @@ ORDER BY p.id DESC
                         batch_counter = 0
 
                     context.log.info(
-                        f"Deleted batch: {records_deleted} records "
-                        f"(chunk {chunk_min}-{chunk_max}, batch ID range {batch_start_id} to {batch_end_id})"
+                        f"Tombstoned batch: {records_deleted} records, skipped {records_skipped} no longer "
+                        f"live orphans (chunk {chunk_min}-{chunk_max}, batch ID range {batch_start_id} to {batch_end_id})"
                     )
 
                     # Update batch_start_id for next iteration
@@ -380,7 +414,7 @@ ORDER BY p.id DESC
             },
         ) from e
 
-    context.log.info(f"Completed chunk {chunk_min}-{chunk_max}: deleted {total_records_deleted} records")
+    context.log.info(f"Completed chunk {chunk_min}-{chunk_max}: tombstoned {total_records_deleted} records")
 
     # Emit metric for chunk completion
     run_id = context.run.run_id
@@ -414,8 +448,8 @@ ORDER BY p.id DESC
 )
 def persons_without_distinct_ids_cleanup_job():
     """
-    Scan posthog_person table for records that have no associated posthog_persondistinctid
-    rows, deleting the corresponding posthog_person rows.
+    Scan posthog_person table for live records that have no associated posthog_persondistinctid
+    rows, tombstoning them in Postgres and ClickHouse.
     Divides the ID space into chunks and processes them in parallel.
     """
     id_range = get_id_range_for_pwdc()

@@ -1,16 +1,28 @@
 """Tests for the posthog_persons without distinct_ids in posthog_persondistinctid cleanup job."""
 
+import uuid as uuid_lib
+
+import pytest
+from posthog.test.base import BaseTest
 from unittest.mock import MagicMock, patch
 
 import psycopg2
 from dagster import build_op_context
 
 from posthog.dags.persons_without_distinct_ids_cleanup import (
+    OrphanTombstones,
     PersonsNoDistinctIdsCleanupConfig,
     create_chunks_for_pwdc,
     get_id_range_for_pwdc,
     scan_delete_chunk_for_pwdc,
+    tombstone_orphan_persons,
 )
+from posthog.models.person.bulk_delete import resolve_persons_for_deletion
+from posthog.personhog_client.fake_client import get_active_fake
+from posthog.personhog_client.proto import DeletePersonsMode
+from posthog.test.persons import create_person
+
+SCAN_MARKER = "SELECT p.team_id, p.uuid"
 
 
 class MockPsycopg2Error(psycopg2.Error):
@@ -177,33 +189,17 @@ class TestCreateChunksForPwdc:
         assert chunks[0].value[0] == min_id and chunks[0].value[1] == max_id
 
 
-def create_mock_database_resource(rowcount_values=None):
-    """
-    Create a mock database resource that mimics psycopg2.extensions.connection.
+def _scan_rows(team_id: int, count: int) -> list[dict]:
+    return [{"team_id": team_id, "uuid": str(uuid_lib.uuid4())} for _ in range(count)]
 
-    Args:
-        rowcount_values: List of rowcount values to return per INSERT call.
-                        If None, defaults to 0. If a single int, uses that for all calls.
-    """
+
+def create_mock_database_resource(scan_results=None):
+    """Mock a psycopg2 connection whose scans return the scan_results row lists in order, or no rows when None."""
     mock_cursor = MagicMock()
-    if rowcount_values is None:
-        mock_cursor.rowcount = 0
-    elif isinstance(rowcount_values, int):
-        mock_cursor.rowcount = rowcount_values
-    else:
-        # Use side_effect to return different rowcounts per call
-        call_count = [0]
-
-        def get_rowcount():
-            if call_count[0] < len(rowcount_values):
-                result = rowcount_values[call_count[0]]
-                call_count[0] += 1
-                return result
-            return rowcount_values[-1] if rowcount_values else 0
-
-        mock_cursor.rowcount = property(lambda self: get_rowcount())
-
     mock_cursor.execute = MagicMock()
+
+    results = list(scan_results or [])
+    mock_cursor.fetchall = MagicMock(side_effect=lambda: results.pop(0) if results else [])
 
     # Make cursor() return a context manager
     mock_conn = MagicMock()
@@ -218,18 +214,29 @@ def create_mock_cluster_resource():
     return MagicMock()
 
 
+@pytest.fixture
+def stub_tombstone():
+    # Counts each scanned person as tombstoned, so the scan loop is tested apart from personhog.
+    with patch(
+        "posthog.dags.persons_without_distinct_ids_cleanup.tombstone_orphan_persons",
+        side_effect=lambda team_id, uuids: OrphanTombstones(tombstoned=len(uuids), skipped=0),
+    ) as tombstone:
+        yield tombstone
+
+
 class TestScanDeleteChunkForPwdc:
     """Test the scan_delete_chunk_for_pwdc function."""
 
-    def test_scan_delete_chunk_single_batch_success(self):
-        """Test successful scan and delete of a single batch within a chunk."""
+    def test_scan_delete_chunk_single_batch_success(self, stub_tombstone):
+        """Test successful scan and tombstone of a single batch within a chunk."""
         config = PersonsNoDistinctIdsCleanupConfig(
             chunk_size=1000,
             batch_size=100,
         )
         chunk = (1, 100)  # Single batch covers entire chunk
 
-        mock_db = create_mock_database_resource(rowcount_values=50)
+        team_1_rows, team_2_rows = _scan_rows(1, 30), _scan_rows(2, 20)
+        mock_db = create_mock_database_resource(scan_results=[team_1_rows + team_2_rows])
         mock_cluster = create_mock_cluster_resource()
 
         context = build_op_context(
@@ -245,6 +252,12 @@ class TestScanDeleteChunkForPwdc:
         assert result["chunk_min"] == 1
         assert result["chunk_max"] == 100
         assert result["records_deleted"] == 50
+
+        # Each team's persons are tombstoned under that team
+        assert sorted(c.args for c in stub_tombstone.call_args_list) == [
+            (1, [r["uuid"] for r in team_1_rows]),
+            (2, [r["uuid"] for r in team_2_rows]),
+        ]
 
         # Verify SET statements called once (session-level, before loop)
         set_statements = [
@@ -266,47 +279,25 @@ class TestScanDeleteChunkForPwdc:
         for stmt in set_statements:
             assert any(stmt in call for call in execute_calls), f"SET statement not found: {stmt}"
 
-        # Verify BEGIN, INSERT, COMMIT called once
+        # Verify BEGIN, scan, COMMIT called once
         assert execute_calls.count("BEGIN") == 1
         assert execute_calls.count("COMMIT") == 1
 
-        # Verify INSERT query format
-        scan_delete_calls = [call for call in execute_calls if "DELETE FROM" in call]
-        assert len(scan_delete_calls) == 1
-        scan_delete_query = scan_delete_calls[0]
-        assert f"DELETE FROM {config.persons_table}" in scan_delete_query
-        assert "WHERE p.id >=" in scan_delete_query
-        assert "AND p.id <=" in scan_delete_query
-        assert "NOT EXISTS" in scan_delete_query
-        assert "ORDER BY p.id DESC" in scan_delete_query
+        # Only the drain may hard-delete person rows
+        assert not any("DELETE" in call for call in execute_calls)
+        scan_calls = [call for call in execute_calls if SCAN_MARKER in call]
+        assert len(scan_calls) == 1
 
-    def test_scan_delete_chunk_multiple_batches(self):
-        """Test scan and delete with multiple batches in a chunk."""
+    def test_scan_delete_chunk_multiple_batches(self, stub_tombstone):
+        """Test scan and tombstone with multiple batches in a chunk."""
         config = PersonsNoDistinctIdsCleanupConfig(
             chunk_size=1000,
             batch_size=100,
         )
         chunk = (1, 250)  # 3 batches: (1,100), (100,200), (200,250)
 
-        mock_db = create_mock_database_resource()
+        mock_db = create_mock_database_resource(scan_results=[_scan_rows(1, 50), _scan_rows(1, 75), _scan_rows(1, 25)])
         mock_cluster = create_mock_cluster_resource()
-
-        # Track rowcount per batch - use a list to track INSERT calls
-        rowcounts = [50, 75, 25]
-        insert_call_count = [0]
-
-        cursor = mock_db.cursor.return_value.__enter__.return_value
-
-        # Track INSERT calls and set rowcount accordingly
-        def execute_with_rowcount(query, *args):
-            if "DELETE FROM" in query:
-                if insert_call_count[0] < len(rowcounts):
-                    cursor.rowcount = rowcounts[insert_call_count[0]]
-                    insert_call_count[0] += 1
-                else:
-                    cursor.rowcount = 0
-
-        cursor.execute.side_effect = execute_with_rowcount
 
         context = build_op_context(
             resources={"database": mock_db, "cluster": mock_cluster},
@@ -330,11 +321,11 @@ class TestScanDeleteChunkForPwdc:
         assert execute_calls.count("BEGIN") == 3
         assert execute_calls.count("COMMIT") == 3
 
-        # Verify INSERT called 3 times
-        insert_calls = [call for call in execute_calls if "DELETE FROM" in call]
-        assert len(insert_calls) == 3
+        # Verify the scan ran 3 times
+        scan_calls = [call for call in execute_calls if SCAN_MARKER in call]
+        assert len(scan_calls) == 3
 
-    def test_scan_delete_chunk_serialization_failure_retry(self):
+    def test_scan_delete_chunk_serialization_failure_retry(self, stub_tombstone):
         """Test that serialization failure triggers retry."""
         config = PersonsNoDistinctIdsCleanupConfig(
             chunk_size=1000,
@@ -347,20 +338,17 @@ class TestScanDeleteChunkForPwdc:
 
         cursor = mock_db.cursor.return_value.__enter__.return_value
 
-        # Track DELETE attempts
-        scan_delete_attempts = [0]
+        # Track scan attempts
+        scan_attempts = [0]
 
-        # First DELETE raises SerializationFailure, second succeeds
+        # First scan raises SerializationFailure, second succeeds
         def execute_side_effect(query, *args):
-            if "DELETE FROM" in query:
-                scan_delete_attempts[0] += 1
-                if scan_delete_attempts[0] == 1:
-                    # First DELETE attempt raises error
+            if SCAN_MARKER in query:
+                scan_attempts[0] += 1
+                if scan_attempts[0] == 1:
                     # Create a mock error with pgcode 40001 for serialization failure
                     error = create_mock_psycopg2_error("could not serialize access due to concurrent update", "40001")
                     raise error
-                # Subsequent calls succeed
-                cursor.rowcount = 50  # Success on retry
 
         cursor.execute.side_effect = execute_side_effect
 
@@ -381,11 +369,11 @@ class TestScanDeleteChunkForPwdc:
         execute_calls = [call[0][0] for call in cursor.execute.call_args_list]
         assert "ROLLBACK" in execute_calls
 
-        # Verify retry succeeded (should have DELETE called twice, COMMIT once)
-        scan_delete_calls = [call for call in execute_calls if "DELETE FROM" in call]
-        assert len(scan_delete_calls) >= 1  # At least one successful DELETE
+        # Verify the scan ran again after the failure
+        scan_calls = [call for call in execute_calls if SCAN_MARKER in call]
+        assert len(scan_calls) == 2
 
-    def test_scan_delete_chunk_deadlock_retry(self):
+    def test_scan_delete_chunk_deadlock_retry(self, stub_tombstone):
         """Test that deadlock triggers retry."""
         config = PersonsNoDistinctIdsCleanupConfig(
             chunk_size=1000,
@@ -398,20 +386,17 @@ class TestScanDeleteChunkForPwdc:
 
         cursor = mock_db.cursor.return_value.__enter__.return_value
 
-        # Track DELETE attempts
-        scan_delete_attempts = [0]
+        # Track scan attempts
+        scan_attempts = [0]
 
-        # First DELETE raises deadlock, second succeeds
+        # First scan raises deadlock, second succeeds
         def execute_side_effect(query, *args):
-            if "DELETE FROM" in query:
-                scan_delete_attempts[0] += 1
-                if scan_delete_attempts[0] == 1:
-                    # First DELETE attempt raises error
+            if SCAN_MARKER in query:
+                scan_attempts[0] += 1
+                if scan_attempts[0] == 1:
                     # Create a mock error with pgcode 40P01 for deadlock
                     error = create_mock_psycopg2_error("deadlock detected", "40P01")
                     raise error
-                # Subsequent calls succeed
-                cursor.rowcount = 50  # Success on retry
 
         cursor.execute.side_effect = execute_side_effect
 
@@ -432,11 +417,11 @@ class TestScanDeleteChunkForPwdc:
         execute_calls = [call[0][0] for call in cursor.execute.call_args_list]
         assert "ROLLBACK" in execute_calls
 
-        # Verify retry succeeded (should have DELETE called twice, COMMIT once)
-        scan_delete_calls = [call for call in execute_calls if "DELETE FROM" in call]
-        assert len(scan_delete_calls) >= 1  # At least one successful DELETE
+        # Verify the scan ran again after the failure
+        scan_calls = [call for call in execute_calls if SCAN_MARKER in call]
+        assert len(scan_calls) == 2
 
-    def test_scan_delete_chunk_error_handling_and_rollback(self):
+    def test_scan_delete_chunk_error_handling_and_rollback(self, stub_tombstone):
         """Test error handling and rollback on non-duplicate errors."""
         config = PersonsNoDistinctIdsCleanupConfig(
             chunk_size=1000,
@@ -449,9 +434,9 @@ class TestScanDeleteChunkForPwdc:
 
         cursor = mock_db.cursor.return_value.__enter__.return_value
 
-        # Raise generic error on INSERT
+        # Raise generic error on the scan
         def execute_side_effect(query, *args):
-            if "DELETE FROM" in query:
+            if SCAN_MARKER in query:
                 raise Exception("Connection lost")
 
         cursor.execute.side_effect = execute_side_effect
@@ -479,15 +464,15 @@ class TestScanDeleteChunkForPwdc:
                 execute_calls = [call[0][0] for call in cursor.execute.call_args_list]
                 assert "ROLLBACK" in execute_calls
 
-    def test_scan_delete_chunk_query_format(self):
-        """Test that DELETE query has correct format."""
+    def test_scan_delete_chunk_query_format(self, stub_tombstone):
+        """Test that the scan query has correct format."""
         config = PersonsNoDistinctIdsCleanupConfig(
             chunk_size=1000,
             batch_size=100,
         )
         chunk = (1, 100)
 
-        mock_db = create_mock_database_resource(rowcount_values=10)
+        mock_db = create_mock_database_resource(scan_results=[_scan_rows(1, 10)])
         mock_cluster = create_mock_cluster_resource()
 
         context = build_op_context(
@@ -502,18 +487,18 @@ class TestScanDeleteChunkForPwdc:
         cursor = mock_db.cursor.return_value.__enter__.return_value
         execute_calls = [call[0][0] for call in cursor.execute.call_args_list]
 
-        # Find INSERT query
-        scan_delete_query = next((call for call in execute_calls if "DELETE FROM" in call), None)
-        assert scan_delete_query is not None
+        scan_query = next((call for call in execute_calls if SCAN_MARKER in call), None)
+        assert scan_query is not None
 
         # Verify query components
-        assert f"DELETE FROM {config.persons_table} AS p" in scan_delete_query
-        assert "WHERE p.id >=" in scan_delete_query
-        assert "AND p.id <=" in scan_delete_query
-        assert "NOT EXISTS" in scan_delete_query
-        assert "ORDER BY p.id DESC" in scan_delete_query
+        assert f"FROM {config.persons_table} AS p" in scan_query
+        assert "WHERE p.id >=" in scan_query
+        assert "AND p.id <=" in scan_query
+        assert "AND NOT p.is_deleted" in scan_query
+        assert "NOT EXISTS" in scan_query
+        assert "ORDER BY p.id DESC" in scan_query
 
-    def test_scan_delete_chunk_session_settings_applied_once(self):
+    def test_scan_delete_chunk_session_settings_applied_once(self, stub_tombstone):
         """Test that SET statements are applied once at session level before batch loop."""
         config = PersonsNoDistinctIdsCleanupConfig(
             chunk_size=1000,
@@ -521,7 +506,7 @@ class TestScanDeleteChunkForPwdc:
         )
         chunk = (1, 150)  # 3 batches
 
-        mock_db = create_mock_database_resource(rowcount_values=25)
+        mock_db = create_mock_database_resource(scan_results=[_scan_rows(1, 25)] * 3)
         mock_cluster = create_mock_cluster_resource()
 
         context = build_op_context(
@@ -673,3 +658,50 @@ class TestGetIdRangeForPwdc:
             description = e.description
             assert "max_id" in description.lower() or "invalid" in description.lower()
             assert "5000" in description or "100" in description
+
+
+class TestTombstoneOrphanPersons(BaseTest):
+    def test_tombstones_only_live_orphans_and_publishes_at_the_postgres_version(self):
+        fake = get_active_fake()
+        orphan = create_person(team=self.team, distinct_ids=[], properties={"email": "orphan@example.com"})
+        # A distinct id attached after the scan read this person as an orphan
+        reattached = create_person(team=self.team, distinct_ids=["late-did"], properties={})
+        already_tombstoned_uuid = str(uuid_lib.uuid4())
+        fake.add_person(
+            team_id=self.team.pk, person_id=987_654, uuid=already_tombstoned_uuid, version=7, is_deleted=True
+        )
+        scanned = [str(orphan.uuid), str(reattached.uuid), already_tombstoned_uuid]
+
+        with patch("posthog.models.person.util.publish_person_tombstone", return_value=[]) as publish:
+            assert tombstone_orphan_persons(self.team.pk, scanned) == OrphanTombstones(tombstoned=1, skipped=2)
+
+        stored_orphan = fake._persons_by_uuid[(self.team.pk, str(orphan.uuid))]
+        assert stored_orphan.is_deleted is True
+        assert stored_orphan.properties == b"{}"
+        publish.assert_called_once()
+        tombstone = publish.call_args.args[1]
+        assert (tombstone.uuid, tombstone.version) == (orphan.uuid, stored_orphan.version)
+        assert fake._persons_by_uuid[(self.team.pk, str(reattached.uuid))].is_deleted is False
+        assert fake._persons_by_uuid[(self.team.pk, already_tombstoned_uuid)].version == 7
+
+    def test_spares_a_person_whose_distinct_id_attached_after_the_re_resolve(self):
+        fake = get_active_fake()
+        person = create_person(team=self.team, distinct_ids=["race-did"], properties={})
+
+        with (
+            patch(
+                "posthog.dags.persons_without_distinct_ids_cleanup.resolve_persons_for_deletion",
+                side_effect=lambda team_id, uuids, _: resolve_persons_for_deletion(
+                    team_id, uuids, None, with_distinct_ids=False
+                ),
+            ),
+            patch("posthog.models.person.util.publish_person_tombstone", return_value=[]) as publish,
+        ):
+            assert tombstone_orphan_persons(self.team.pk, [str(person.uuid)]) == OrphanTombstones(
+                tombstoned=0, skipped=1
+            )
+
+        publish.assert_not_called()
+        assert fake._persons_by_uuid[(self.team.pk, str(person.uuid))].is_deleted is False
+        delete_request = next(call.request for call in fake.calls if call.method == "delete_persons")
+        assert delete_request.mode == DeletePersonsMode.DELETE_PERSONS_MODE_TOMBSTONE_IF_NO_DISTINCT_IDS

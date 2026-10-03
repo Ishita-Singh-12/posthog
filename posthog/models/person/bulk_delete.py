@@ -175,6 +175,7 @@ def delete_persons_profile(
     request=None,
     organization_id=None,
     queue_ai_training_deletion: bool = True,
+    skip_persons_with_distinct_ids: bool = False,
 ) -> PersonProfileDeletionResult:
     """Tombstone the persons in Postgres and publish their ClickHouse tombstones.
 
@@ -192,9 +193,38 @@ def delete_persons_profile(
         actor=actor,
         was_impersonated=is_impersonated(request),
         organization_id=organization_id,
+        skip_persons_with_distinct_ids=skip_persons_with_distinct_ids,
     )
     _observe_person_outcomes("sync", result)
     return result
+
+
+class PersonTombstoneFailed(Exception):
+    """The Postgres tombstone failed for some persons, so they are still live and a retry must resolve them again."""
+
+
+def tombstone_and_publish_persons(
+    team_id: int, persons: builtins.list[Person], *, skip_persons_with_distinct_ids: bool = False
+) -> int:
+    """Tombstone persons for a maintenance job and publish their ClickHouse tombstones; returns how many were tombstoned.
+
+    Raises PersonTombstoneFailed when a Postgres tombstone fails, because that person is still live.
+    A failed ClickHouse publish does not raise, because the weekly deletion sweep republishes from the tombstone queue.
+    """
+    result = delete_persons_profile(
+        team_id,
+        persons,
+        actor=None,
+        queue_ai_training_deletion=False,
+        skip_persons_with_distinct_ids=skip_persons_with_distinct_ids,
+    )
+    if result.retryable_errors:
+        first = next(f for f in result.failures if f.step not in STEPS_AFTER_DELETION)
+        raise PersonTombstoneFailed(
+            f"Postgres tombstone failed for {len(result.retryable_errors)} of {len(persons)} persons in team "
+            f"{team_id}: {first.error}"
+        )
+    return result.deleted_count
 
 
 # Page size for the keyset walk over a person's distinct IDs. Each page is one bounded RPC, so a
@@ -205,6 +235,35 @@ QUEUED_DELETION_DISTINCT_ID_PAGE_SIZE = 5000
 # The deletion steps run once this many distinct IDs are in memory, so several wide persons in one
 # chunk cannot pile up on a worker; the bound is this cap plus one person's worth of IDs.
 QUEUED_DELETION_DISTINCT_IDS_PER_BATCH = 20_000
+
+
+def tombstone_and_publish_persons_by_uuids(team_id: int, person_uuids: builtins.list[str]) -> int:
+    """Tombstone persons by uuid like tombstone_and_publish_persons, paging each person's distinct IDs; returns how many were tombstoned."""
+    from posthog.personhog_client.client import personhog_call
+
+    def _fetch_distinct_ids(person_id: int) -> builtins.list[DistinctIdForPerson]:
+        return personhog_call(
+            "get_distinct_ids_for_tombstone",
+            lambda: _paginated_get_distinct_ids_for_person(
+                team_id, person_id, page_size=QUEUED_DELETION_DISTINCT_ID_PAGE_SIZE
+            ),
+            caller_tag="persons/deletion-distinct-ids",
+        )
+
+    tombstoned = 0
+    batch: builtins.list[Person] = []
+    batch_distinct_id_count = 0
+    for person in resolve_persons_for_deletion(team_id, person_uuids, None, with_distinct_ids=False):
+        distinct_ids = _fetch_distinct_ids(person.pk)
+        person._distinct_ids = [d.id for d in distinct_ids]
+        batch.append(person)
+        batch_distinct_id_count += len(distinct_ids)
+        if batch_distinct_id_count >= QUEUED_DELETION_DISTINCT_IDS_PER_BATCH:
+            tombstoned += tombstone_and_publish_persons(team_id, batch)
+            batch, batch_distinct_id_count = [], 0
+    if batch:
+        tombstoned += tombstone_and_publish_persons(team_id, batch)
+    return tombstoned
 
 
 @frozen
@@ -435,6 +494,7 @@ def _tombstone_and_delete_persons(
     actor: User | None,
     was_impersonated: bool,
     organization_id: uuid_lib.UUID | None,
+    skip_persons_with_distinct_ids: bool = False,
 ) -> PersonProfileDeletionResult:
     """Tombstone each person in Postgres, publish the ClickHouse tombstones, then log the deletions.
 
@@ -446,7 +506,9 @@ def _tombstone_and_delete_persons(
     raising would hide a completed deletion behind an error.
     """
     failures: builtins.list[PersonDeletionFailure] = []
-    deleted = _tombstone_persons_at_exact_versions(team_id, persons, failures)
+    deleted = _tombstone_persons_at_exact_versions(
+        team_id, persons, failures, skip_persons_with_distinct_ids=skip_persons_with_distinct_ids
+    )
 
     if organization_id is not None and deleted:
         try:
@@ -493,6 +555,8 @@ def _tombstone_persons_at_exact_versions(
     team_id: int,
     persons: builtins.list[Person],
     failures: builtins.list[PersonDeletionFailure],
+    *,
+    skip_persons_with_distinct_ids: bool = False,
 ) -> builtins.list[Person]:
     """Tombstone Postgres first, then publish ClickHouse tombstones at the versions it wrote.
 
@@ -507,7 +571,9 @@ def _tombstone_persons_at_exact_versions(
     for batch in _batches_by_distinct_id_count(persons):
         uuids = [person.uuid for person in batch]
         try:
-            tombstones = tombstone_persons_in_postgres(team_id, uuids)
+            tombstones = tombstone_persons_in_postgres(
+                team_id, uuids, skip_persons_with_distinct_ids=skip_persons_with_distinct_ids
+            )
         except Exception as exc:
             tombstones = _committed_tombstones(team_id, uuids, exc, failures)
         to_publish = [
