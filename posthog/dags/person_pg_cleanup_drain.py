@@ -1,7 +1,9 @@
 """Drain person_pg_cleanup_queue into Postgres hard deletes.
 
 The ClickHouse sweep (clickhouse_cleanup.py) removes a deleted person's rows from ClickHouse and
-queues the person here. Postgres still holds the tombstoned posthog_person row and its dependent
+queues the person here. The sweep writes each row before its delete with awaiting_delete_run set,
+and clears it after the delete. The drain reads only rows where it is NULL, because ClickHouse can
+still hold the person of any other row. Postgres still holds the tombstoned posthog_person row and its dependent
 rows (distinct ids, hash key overrides, cohort memberships) until this job asks personhog to
 delete them.
 
@@ -403,6 +405,7 @@ def _read_page(
         SELECT team_id, person_uuid, deleted_at
         FROM {PG_CLEANUP_QUEUE_TABLE}
         WHERE (blocked_at IS NULL OR blocked_at < %(blocked_before)s)
+          AND awaiting_delete_run IS NULL
           {cursor_filter}
         ORDER BY team_id, person_uuid
         LIMIT %(limit)s

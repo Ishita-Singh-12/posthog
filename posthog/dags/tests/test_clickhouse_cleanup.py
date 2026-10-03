@@ -15,7 +15,6 @@ import dagster
 import psycopg2
 from clickhouse_driver import Client
 from prometheus_client import CollectorRegistry
-from psycopg2 import OperationalError
 
 from posthog.clickhouse.cleanup_snapshots import (
     CLEANUP_DELETED_PERSONS_TABLE,
@@ -190,10 +189,22 @@ def seed_decoy_run(cluster: ClickhouseCluster, spared_person: str, spared_distin
     ).result()
 
 
-def queued_rows(conn) -> list[tuple]:
+def drainable_rows(conn) -> list[tuple]:
     with conn.cursor() as cursor:
-        cursor.execute(f"SELECT team_id, person_uuid, deleted_at, blocked_at FROM {PG_CLEANUP_QUEUE_TABLE} ORDER BY 2")
+        cursor.execute(
+            f"SELECT team_id, person_uuid, deleted_at, blocked_at FROM {PG_CLEANUP_QUEUE_TABLE}"
+            " WHERE awaiting_delete_run IS NULL ORDER BY 2"
+        )
         return cursor.fetchall()
+
+
+def held_back_rows(conn) -> dict[str, str]:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"SELECT person_uuid::text, awaiting_delete_run FROM {PG_CLEANUP_QUEUE_TABLE}"
+            " WHERE awaiting_delete_run IS NOT NULL"
+        )
+        return dict(cursor.fetchall())
 
 
 def seed_cohort_rows(cluster: ClickhouseCluster, count: int) -> None:
@@ -341,7 +352,7 @@ def test_the_age_floor_defers_tombstones_produced_too_recently(cluster: Clickhou
     # A background merge may collapse two versions at any point, so only survival is stable.
     assert cluster.any_host(rows_for(deleted_recently)).result() > 0
     assert cluster.any_host(rows_for(deleted_again)).result() > 0
-    assert [str(row[1]) for row in queued_rows(persons_database)] == [swept]
+    assert [str(row[1]) for row in drainable_rows(persons_database)] == [swept]
     assert cluster.any_host(surviving_distinct_ids).result() == {"young_tombstone", "young_tombstone_of_swept_person"}
 
 
@@ -359,7 +370,7 @@ def test_queues_the_deleted_persons_for_postgres(cluster: ClickhouseCluster, per
     result = run_job(cluster, persons_database)
 
     assert result.output_for_node("publish_sweep_metrics").queued_for_postgres == 1
-    rows = queued_rows(persons_database)
+    rows = drainable_rows(persons_database)
     assert len(rows) == 1
     team_id, person_uuid, deleted_at, blocked_at = rows[0]
     assert (team_id, str(person_uuid)) == (TEAM_ID, deleted)
@@ -369,40 +380,59 @@ def test_queues_the_deleted_persons_for_postgres(cluster: ClickhouseCluster, per
     # A second run must not raise on the primary key: it re-queues persons the drain has not
     # reached yet.
     run_job(cluster, persons_database)
-    assert len(queued_rows(persons_database)) == 1
+    assert len(drainable_rows(persons_database)) == 1
 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("failing_op", ["delete_persons", "persist_deleted_persons"])
-def test_a_failed_person_delete_queues_nothing_for_postgres(
+def test_a_failed_run_holds_its_persons_back_until_the_next_sweep_settles_them(
     cluster: ClickhouseCluster, persons_database, failing_op: str
 ):
-    # The drain removes every queued person from Postgres. A person queued ahead of a delete that
-    # then fails is gone from Postgres while ClickHouse still holds it.
+    # A drainable row ahead of a failed delete lets the drain remove a person that ClickHouse
+    # still holds. No row at all after a successful delete leaks the Postgres person for good,
+    # because no later snapshot can find it. The next sweep has to tell the two apart.
     doomed = create_person(team_id=TEAM_ID, version=0, is_deleted=True)
     real_runner = clickhouse_cleanup.LightweightDeleteMutationRunner
+    real_write = clickhouse_cleanup._write_queue_page
 
     def fail_on_the_person_table(*args, **kwargs):
         if kwargs["table"] == clickhouse_cleanup.PERSONS_TABLE:
             raise RuntimeError("person delete failed")
         return real_runner(*args, **kwargs)
 
-    def fail_the_queue_write(*args, **kwargs):
-        raise RuntimeError("queue write failed")
+    def fail_the_release(connection, cursor, page, deleted_at, awaiting_delete_run=None):
+        if awaiting_delete_run is None:
+            # allow_retries=False skips the op's retry policy, whose delays run on the wall clock.
+            raise dagster.Failure("queue write failed", allow_retries=False)
+        return real_write(connection, cursor, page, deleted_at, awaiting_delete_run)
 
     failure = (
         patch.object(clickhouse_cleanup, "LightweightDeleteMutationRunner", fail_on_the_person_table)
         if failing_op == "delete_persons"
-        else patch.object(clickhouse_cleanup, "_write_queue_page", fail_the_queue_write)
+        else patch.object(clickhouse_cleanup, "_write_queue_page", fail_the_release)
     )
     with failure, patch.object(clickhouse_cleanup, "_emit", wraps=clickhouse_cleanup._emit) as emit:
-        result = run_job(cluster, persons_database, raise_on_error=False)
+        failed = run_job(cluster, persons_database, raise_on_error=False)
 
-    assert not result.success
-    assert cluster.any_host(rows_for(doomed)).result() == (1 if failing_op == "delete_persons" else 0)
-    assert queued_rows(persons_database) == []
+    assert not failed.success
+    delete_failed = failing_op == "delete_persons"
+    assert cluster.any_host(rows_for(doomed)).result() == (1 if delete_failed else 0)
+    assert drainable_rows(persons_database) == []
+    assert held_back_rows(persons_database) == {doomed: failed.run_id.replace("-", "_")}
     persist_failures = [call for call in emit.call_args_list if call.args[1] == "clickhouse_cleanup_persist_failed"]
-    assert len(persist_failures) == (1 if failing_op == "persist_deleted_persons" else 0)
+    assert len(persist_failures) == (0 if delete_failed else 1)
+
+    settled = run_job(cluster, persons_database).output_for_node("publish_sweep_metrics")
+
+    # A failed delete leaves the person in ClickHouse, so its row is dropped and this run queues it
+    # afresh. A failed persist leaves nothing in ClickHouse, so only the release can queue it.
+    assert (settled.abandoned_queue_rows_released, settled.abandoned_queue_rows_dropped) == (
+        (0, 1) if delete_failed else (1, 0)
+    )
+    assert settled.queued_for_postgres == (1 if delete_failed else 0)
+    assert cluster.any_host(rows_for(doomed)).result() == 0
+    assert [str(row[1]) for row in drainable_rows(persons_database)] == [doomed]
+    assert held_back_rows(persons_database) == {}
 
 
 @pytest.mark.django_db
@@ -415,7 +445,7 @@ def test_queues_every_person_across_page_boundaries(cluster: ClickhouseCluster, 
 
     run_job(cluster, persons_database)
 
-    assert sorted(str(row[1]) for row in queued_rows(persons_database)) == expected
+    assert sorted(str(row[1]) for row in drainable_rows(persons_database)) == expected
 
 
 @pytest.mark.django_db
@@ -428,19 +458,19 @@ def test_resweeping_a_pending_person_refreshes_deleted_at_and_clears_blocked_at(
     # the row blocked forever and leak that person's Postgres rows for good.
     deleted = create_person(team_id=TEAM_ID, version=0, is_deleted=True)
     run_job(cluster, persons_database)
-    [(_, _, first_deleted_at, _)] = queued_rows(persons_database)
+    [(_, _, first_deleted_at, _)] = drainable_rows(persons_database)
 
     # Stand in for the drain having found the person blocked.
     with persons_database.cursor() as cursor:
         cursor.execute(f"UPDATE {PG_CLEANUP_QUEUE_TABLE} SET blocked_at = now()")
     persons_database.commit()
-    assert queued_rows(persons_database)[0][3] is not None
+    assert drainable_rows(persons_database)[0][3] is not None
 
     # The same person is deleted again at a higher version, so a later run snapshots it afresh.
     create_person(uuid=deleted, team_id=TEAM_ID, version=10, is_deleted=True)
     run_job(cluster, persons_database)
 
-    rows = queued_rows(persons_database)
+    rows = drainable_rows(persons_database)
     assert len(rows) == 1, "the row is keyed on (team_id, person_uuid), so this stays a single row"
     assert rows[0][2] > first_deleted_at, "deleted_at must move to the later sweep"
     assert rows[0][3] is None, "blocked_at must be cleared so the drain retries the person"
@@ -560,12 +590,15 @@ def test_the_janitor_kills_a_stranded_runs_mutations_before_dropping(
 
 
 @pytest.mark.django_db
-def test_a_dry_run_never_dials_postgres(cluster: ClickhouseCluster, persons_database):
+@pytest.mark.parametrize(
+    "queue_op", [clickhouse_cleanup.queue_persons_before_delete, clickhouse_cleanup.persist_deleted_persons]
+)
+def test_a_dry_run_never_dials_postgres(cluster: ClickhouseCluster, persons_database, queue_op):
     # The EU dry run failed at Postgres resource init on a network path a dry run never needed.
     # Connecting inside the op, after the dry-run return, keeps a dry run ClickHouse-only.
     run = clickhouse_cleanup.CleanupRun.for_run("dry_run_no_pg", clickhouse_cleanup.CleanupConfig(dry_run=True))
     with patch.object(clickhouse_cleanup.psycopg2, "connect", side_effect=AssertionError("dialed postgres")):
-        clickhouse_cleanup.persist_deleted_persons(dagster.build_op_context(), cluster, "postgres://unused", run)
+        queue_op(dagster.build_op_context(), cluster, "postgres://unused", run)
 
 
 @pytest.mark.django_db
@@ -584,7 +617,8 @@ def test_a_postgres_connect_failure_drops_the_dictionaries(cluster: ClickhouseCl
         # keep working, or the cohort op fails first and the wrong step trips the hook.
 
         if args and isinstance(args[0], str):
-            raise OperationalError("connection timed out")
+            # allow_retries=False skips the op's retry policy, whose delays run on the wall clock.
+            raise dagster.Failure("connection timed out", allow_retries=False)
 
         return real_connect(*args, **kwargs)
 
@@ -606,11 +640,11 @@ def test_a_capped_run_deletes_a_slice_and_the_next_run_drains_the_rest(cluster: 
 
     run_job(cluster, persons_database, run_config=capped)
     assert cluster.any_host(visible_persons).result() == 1
-    assert len(queued_rows(persons_database)) == 2
+    assert len(drainable_rows(persons_database)) == 2
 
     run_job(cluster, persons_database, run_config=capped)
     assert cluster.any_host(visible_persons).result() == 0
-    assert len(queued_rows(persons_database)) == 3
+    assert len(drainable_rows(persons_database)) == 3
 
 
 @pytest.mark.django_db
@@ -657,8 +691,20 @@ def test_a_same_run_retry_rewrites_no_rows(cluster: ClickhouseCluster, persons_d
             [row] = cursor.fetchall()
             return row
 
+    # Settling only touches other runs' rows. Settling this run's own row would drop it, since
+    # ClickHouse still holds the person before the delete, and then queue it again.
+    clickhouse_cleanup.queue_persons_before_delete(
+        dagster.build_op_context(), cluster, persons_db_url(writer=True), run
+    )
+    held = queue_row()
+    clickhouse_cleanup.queue_persons_before_delete(
+        dagster.build_op_context(), cluster, persons_db_url(writer=True), run
+    )
+    assert queue_row() == held
+
     clickhouse_cleanup.persist_deleted_persons(dagster.build_op_context(), cluster, persons_db_url(writer=True), run)
     first = queue_row()
+    assert first[0] != held[0], "releasing the held-back row is a real write"
 
     clickhouse_cleanup.persist_deleted_persons(dagster.build_op_context(), cluster, persons_db_url(writer=True), run)
     assert queue_row() == first
@@ -699,7 +745,7 @@ def test_excludes_a_person_revived_while_the_run_is_in_flight(cluster: Clickhous
     assert cluster.any_host(rows_for(revived)).result() > 0
     # The queued set has to match the set deleted in ClickHouse. If they diverge, the Postgres
     # drain clears a person that is still live here.
-    assert [str(row[1]) for row in queued_rows(persons_database)] == [doomed]
+    assert [str(row[1]) for row in drainable_rows(persons_database)] == [doomed]
 
 
 @pytest.mark.django_db
@@ -712,7 +758,7 @@ def test_no_op_when_nothing_is_soft_deleted(cluster: ClickhouseCluster, persons_
 
     assert cluster.any_host(visible_persons).result() == 1
     assert cluster.any_host(surviving_distinct_ids).result() == {"kept"}
-    assert queued_rows(persons_database) == []
+    assert drainable_rows(persons_database) == []
 
 
 @pytest.mark.django_db
@@ -741,7 +787,7 @@ def test_dry_run_deletes_nothing(cluster: ClickhouseCluster, persons_database):
     assert cluster.any_host(visible_persons).result() == 1
     assert cluster.any_host(surviving_distinct_ids).result() == {"gone"}
     assert cluster.any_host(cohort_rows).result() == 5
-    assert queued_rows(persons_database) == []
+    assert drainable_rows(persons_database) == []
     assert AsyncDeletion.objects.get(team_id=TEAM_ID).delete_verified_at is None
 
 
@@ -845,7 +891,7 @@ def test_a_run_ignores_another_runs_snapshot_rows(cluster: ClickhouseCluster, pe
     assert cluster.any_host(rows_for(live)).result() == 1
     assert cluster.any_host(surviving_distinct_ids).result() == {"kept"}
     assert cluster.any_host(rows_for(doomed)).result() == 0
-    assert [str(row[1]) for row in queued_rows(persons_database)] == [doomed]
+    assert [str(row[1]) for row in drainable_rows(persons_database)] == [doomed]
     # Clearing rows at the end of a run has to be scoped too, or one run wipes another's worklist.
     assert cluster.any_host(snapshot_rows_for_run(DECOY_RUN_ID)).result() > 0
 
@@ -1257,7 +1303,7 @@ def test_the_sweep_waits_for_an_executing_drain_before_it_touches_anything(
         if run is None or run.is_finished:
             real_sleep(seconds)
             return
-        seen_while_draining.append((cluster.any_host(rows_for(doomed)).result(), queued_rows(persons_database)))
+        seen_while_draining.append((cluster.any_host(rows_for(doomed)).result(), drainable_rows(persons_database)))
         instance.report_run_canceled(run)
 
     # The patch replaces time.sleep for every caller in the process, so other callers keep the real one.
@@ -1324,6 +1370,8 @@ def test_publishes_every_measurement_the_run_took() -> None:
         revived_person_count=3,
         revived_distinct_id_count=4,
         queued_for_postgres=7,
+        abandoned_queue_rows_released=5,
+        abandoned_queue_rows_dropped=6,
         mutation_seconds_max=1.5,
         stranded_runs_reaped=2,
     )
@@ -1337,6 +1385,8 @@ def test_publishes_every_measurement_the_run_took() -> None:
     assert registry.get_sample_value(f"{prefix}revived_persons") == 3
     assert registry.get_sample_value(f"{prefix}revived_distinct_ids") == 4
     assert registry.get_sample_value(f"{prefix}queued_for_postgres") == 7
+    assert registry.get_sample_value(f"{prefix}abandoned_queue_rows_released") == 5
+    assert registry.get_sample_value(f"{prefix}abandoned_queue_rows_dropped") == 6
     assert registry.get_sample_value(f"{prefix}mutation_seconds_max") == 1.5
     assert registry.get_sample_value(f"{prefix}stranded_runs_reaped") == 2
     last_success = registry.get_sample_value(f"{prefix}last_success_timestamp_seconds")

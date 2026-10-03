@@ -201,13 +201,26 @@ def test_deletes_tombstoned_persons_and_removes_their_queue_rows(cluster: Clickh
     a1 = seed_tombstoned(fake, TEAM_A, 1)
     a2 = seed_tombstoned(fake, TEAM_A, 2)
     b1 = seed_tombstoned(fake, TEAM_B, 3)
-    queue(persons_database, [(TEAM_A, a1, SWEEP_1), (TEAM_A, a2, SWEEP_1), (TEAM_B, b1, SWEEP_1)])
+    # Held back by a sweep that has not confirmed its ClickHouse delete, so ClickHouse may still
+    # hold the person.
+    held = seed_tombstoned(fake, TEAM_B, 4)
+    queue(
+        persons_database,
+        [(TEAM_A, a1, SWEEP_1), (TEAM_A, a2, SWEEP_1), (TEAM_B, b1, SWEEP_1), (TEAM_B, held, SWEEP_1)],
+    )
+    with persons_database.cursor() as cursor:
+        cursor.execute(
+            f"UPDATE {PG_CLEANUP_QUEUE_TABLE} SET awaiting_delete_run = 'unfinished_sweep' WHERE person_uuid = %s",
+            (held,),
+        )
+    persons_database.commit()
 
     result = run_job(cluster)
 
     assert result.success
     assert not present(fake, TEAM_A, a1) and not present(fake, TEAM_A, a2) and not present(fake, TEAM_B, b1)
-    assert queued(persons_database) == []
+    assert present(fake, TEAM_B, held)
+    assert [row[1] for row in queued(persons_database)] == [held]
     requests = delete_requests(fake)
     assert sorted(request.team_id for request in requests) == [TEAM_A, TEAM_B]
     assert {uuid for request in requests for uuid in request.person_uuids} == {a1, a2, b1}

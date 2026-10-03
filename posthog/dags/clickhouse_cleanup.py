@@ -12,7 +12,7 @@ the Postgres handoff, reads the snapshot rather than recomputing it.
 
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -61,6 +61,10 @@ PG_CLEANUP_QUEUE_TABLE = "person_pg_cleanup_queue"
 # How many queued persons travel per ClickHouse read and per Postgres upsert transaction. Bounds
 # the op's memory to one page however large the snapshot is.
 PERSIST_PAGE_SIZE = 50_000
+
+# Abandoned queue rows checked per ClickHouse lookup. Each page goes to every data host as an IN
+# list, so it stays much smaller than a persist page.
+ABANDONED_ROWS_PAGE_SIZE = 1_000
 
 # Each delete runs as one pair of ordered mutations per contiguous team-id range. Batches run in
 # sequence, never in parallel, and ranges do not reduce what a mutation reads or rewrites: merged
@@ -514,8 +518,10 @@ class CleanupRun:
     stranded_runs_reaped: int = 0  # clear_removed_cohort_data
     revived_person_count: int = 0  # both recheck_revived_persons checkpoints, summed
     revived_distinct_id_count: int = 0  # both recheck_revived_persons checkpoints, summed
+    abandoned_queue_rows_released: int = 0  # queue_persons_before_delete
+    abandoned_queue_rows_dropped: int = 0  # queue_persons_before_delete
     queued_for_postgres: int = 0  # persist_deleted_persons
-    pg_queue_conflict_retries: int = 0  # persist_deleted_persons
+    pg_queue_conflict_retries: int = 0  # both queue ops, summed
     mutation_seconds_max: float = 0.0  # the slowest mutation of either delete op
 
     @classmethod
@@ -1211,36 +1217,25 @@ def delete_orphaned_distinct_ids(
     )
 
 
-# The drain does not run beside this op, but any other session that locks these rows can still
+# The drain does not run beside these ops, but any other session that locks these rows can still
 # conflict, and a lock conflict would otherwise fail the whole weekly sweep.
 PG_QUEUE_CONFLICT_CODES = frozenset({"55P03", "40P01"})
 PG_QUEUE_RETRY_WINDOW_SECONDS = 300.0
 PG_QUEUE_RETRY_BACKOFF_SECONDS = 1.0
 
+# Covers what the in-op conflict retry does not, such as a dropped connection. Both queue ops are
+# idempotent. Dagster fires the failure hook only after the last attempt, so the run keeps its
+# dictionaries while a retry is pending.
+QUEUE_OP_RETRY_POLICY = dagster.RetryPolicy(max_retries=3, delay=60, backoff=dagster.Backoff.EXPONENTIAL)
 
-def _write_queue_page(
-    connection: psycopg2.extensions.connection,
-    cursor: psycopg2.extensions.cursor,
-    page: list[tuple[int, str]],
-    deleted_at: datetime | None,
-) -> int:
-    """Upsert one page, retrying a lock or deadlock conflict. Returns the retries it took."""
+
+def _retry_queue_conflicts(connection: psycopg2.extensions.connection, statement: Callable[[], object]) -> int:
+    """Run one queue statement, retrying a lock or deadlock conflict. Returns the retries it took."""
     retries = 0
     deadline = time.monotonic() + PG_QUEUE_RETRY_WINDOW_SECONDS
     while True:
         try:
-            execute_values(
-                cursor,
-                f"""
-                INSERT INTO {PG_CLEANUP_QUEUE_TABLE} (team_id, person_uuid, deleted_at)
-                VALUES %s
-                ON CONFLICT (team_id, person_uuid) DO UPDATE
-                SET deleted_at = EXCLUDED.deleted_at, blocked_at = NULL
-                WHERE {PG_CLEANUP_QUEUE_TABLE}.deleted_at IS DISTINCT FROM EXCLUDED.deleted_at
-                """,
-                [(team_id, str(person_id), deleted_at) for team_id, person_id in page],
-                page_size=1000,
-            )
+            statement()
             return retries
         except psycopg2.Error as exc:
             remaining = deadline - time.monotonic()
@@ -1255,18 +1250,318 @@ def _write_queue_page(
             time.sleep(pause)
 
 
-@dagster.op
+def _write_queue_page(
+    connection: psycopg2.extensions.connection,
+    cursor: psycopg2.extensions.cursor,
+    page: list[tuple[int, str]],
+    deleted_at: datetime | None,
+    awaiting_delete_run: str | None = None,
+) -> int:
+    """Upsert one page, retrying a lock or deadlock conflict. Returns the retries it took.
+
+    The drain skips a row that names an awaiting_delete_run, and None makes the row drainable.
+    """
+    # A row still pending from an earlier sweep takes this run's deleted_at, and if the drain had
+    # marked it blocked (tombstoned person still owning a live distinct id) the block is lifted,
+    # because a fresh ClickHouse tombstone is new evidence the drain should act on. The WHERE keeps
+    # a retried op from rewriting rows that already hold this run's values: an unconditional DO
+    # UPDATE writes a new tuple version per row, so a retry over millions of rows would leave that
+    # many dead tuples for the persons writer to vacuum.
+    return _retry_queue_conflicts(
+        connection,
+        partial(
+            execute_values,
+            cursor,
+            f"""
+            INSERT INTO {PG_CLEANUP_QUEUE_TABLE} (team_id, person_uuid, deleted_at, awaiting_delete_run)
+            VALUES %s
+            ON CONFLICT (team_id, person_uuid) DO UPDATE
+            SET deleted_at = EXCLUDED.deleted_at,
+                awaiting_delete_run = EXCLUDED.awaiting_delete_run,
+                blocked_at = NULL
+            WHERE {PG_CLEANUP_QUEUE_TABLE}.deleted_at IS DISTINCT FROM EXCLUDED.deleted_at
+               OR {PG_CLEANUP_QUEUE_TABLE}.awaiting_delete_run IS DISTINCT FROM EXCLUDED.awaiting_delete_run
+            """,
+            [(team_id, str(person_id), deleted_at, awaiting_delete_run) for team_id, person_id in page],
+            page_size=1000,
+        ),
+    )
+
+
+def _connect_to_queue(persons_database_url: str) -> psycopg2.extensions.connection:
+    # Connected inside the ops rather than at resource init: a connect failure at init happens
+    # before the step exists, so no failure hook runs and the run's dictionaries are stranded.
+    # Failing inside the op is a step failure, which is what lets drop_assets_on_failure fire. It
+    # also keeps a dry run from dialing Postgres at all.
+    connection = psycopg2.connect(persons_database_url, connect_timeout=10)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SET application_name = 'clickhouse_cleanup'")
+            # Bounded so a lock conflict on the queue fails the page instead of holding a transaction
+            # open on the persons writer; the per-page upsert is idempotent, so a retry is safe.
+            cursor.execute("SET statement_timeout = '120s'")
+            cursor.execute("SET lock_timeout = '10s'")
+        # SET is transactional, so without this commit a retry's rollback reverts all three.
+        # The role's own lock_timeout is 0, which would leave the next conflict unbounded.
+        connection.commit()
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _read_run_persons_page(client: Client, run: CleanupRun, after: tuple[int, str] | None) -> list[tuple[int, str]]:
+    # Reads the snapshot directly rather than the dictionary's query, so adding attributes to
+    # the dictionary cannot silently change the shape of what gets queued. Keyset pagination
+    # over (team_id, person_id) follows the table's sort key, and DISTINCT collapses the
+    # duplicate versions a retried snapshot insert can leave in the ReplacingMergeTree.
+    page_filter = "AND (team_id, person_id) > (%(after_team)s, toUUID(%(after_person)s))" if after else ""
+    return client.execute(
+        f"""
+        SELECT DISTINCT team_id, person_id FROM {run.persons.qualified_name}
+        WHERE run_id = %(run_id)s
+          AND (team_id, person_id) NOT IN ({run.revived.run_keys_query})
+          {page_filter}
+        ORDER BY team_id, person_id
+        LIMIT %(limit)s
+        """,
+        {
+            "run_id": run.persons.run_id,
+            "limit": PERSIST_PAGE_SIZE,
+            "after_team": after[0] if after else 0,
+            "after_person": after[1] if after else "",
+        },
+        settings=run.query_settings,
+    )
+
+
+@frozen
+class _QueueWrite:
+    persons: int
+    conflict_retries: int
+
+
+def _queue_run_persons(
+    cluster: ClickhouseCluster,
+    connection: psycopg2.extensions.connection,
+    run: CleanupRun,
+    awaiting_delete_run: str | None,
+) -> _QueueWrite:
+    persons = 0
+    conflict_retries = 0
+    after: tuple[int, str] | None = None
+    with connection.cursor() as cursor:
+        while True:
+            page = cluster.any_host_by_role(
+                partial(_read_run_persons_page, run=run, after=after), NodeRole.DATA
+            ).result()
+            if not page:
+                break
+            conflict_retries += _write_queue_page(
+                connection, cursor, page, run.distinct_ids_deleted_at, awaiting_delete_run
+            )
+            # The conflict guard makes rowcount "rows changed", not "rows queued"; the metric is
+            # the queued set, which is the page.
+            persons += len(page)
+            # Commit per page: the upsert makes replays idempotent, and one transaction across
+            # millions of rows would hold WAL and xmin on the persons writer for the whole op.
+            connection.commit()
+            if len(page) < PERSIST_PAGE_SIZE:
+                break
+            last_team, last_person = page[-1]
+            after = (last_team, str(last_person))
+    return _QueueWrite(persons=persons, conflict_retries=conflict_retries)
+
+
+@frozen
+class _AwaitingRow:
+    awaiting_delete_run: str
+    team_id: int
+    person_uuid: str
+
+
+@frozen
+class _SettledRows:
+    released: int
+    dropped: int
+    conflict_retries: int
+
+
+def _read_abandoned_page(
+    cursor: psycopg2.extensions.cursor, run_tag: str, after: _AwaitingRow | None
+) -> list[_AwaitingRow]:
+    page_filter = (
+        "AND (awaiting_delete_run, team_id, person_uuid) > (%(after_run)s, %(after_team)s, %(after_person)s::uuid)"
+        if after
+        else ""
+    )
+    cursor.execute(
+        f"""
+        SELECT awaiting_delete_run, team_id, person_uuid::text FROM {PG_CLEANUP_QUEUE_TABLE}
+        WHERE awaiting_delete_run IS NOT NULL AND awaiting_delete_run <> %(run_tag)s
+          {page_filter}
+        ORDER BY awaiting_delete_run, team_id, person_uuid
+        LIMIT %(limit)s
+        """,
+        {
+            "run_tag": run_tag,
+            "limit": ABANDONED_ROWS_PAGE_SIZE,
+            "after_run": after.awaiting_delete_run if after else None,
+            "after_team": after.team_id if after else None,
+            "after_person": after.person_uuid if after else None,
+        },
+    )
+    return [
+        _AwaitingRow(awaiting_delete_run=awaiting_delete_run, team_id=team_id, person_uuid=person_uuid)
+        for awaiting_delete_run, team_id, person_uuid in cursor.fetchall()
+    ]
+
+
+def _persons_in_clickhouse(
+    client: Client, rows: Sequence[_AwaitingRow], settings: Mapping[str, int]
+) -> set[tuple[int, str]]:
+    # Any surviving version counts, tombstone included. SELECT hides the rows a lightweight delete
+    # removed, so a person the abandoned run deleted reads as absent before any merge.
+    found = client.execute(
+        f"""
+        SELECT DISTINCT team_id, toString(id) FROM {PERSONS_TABLE}
+        WHERE team_id IN %(team_ids)s AND id IN %(person_ids)s
+        """,
+        {
+            "team_ids": sorted({row.team_id for row in rows}),
+            "person_ids": sorted({row.person_uuid for row in rows}),
+        },
+        settings=settings,
+    )
+    return {(team_id, person_id) for team_id, person_id in found}
+
+
+def _apply_settlement(
+    cursor: psycopg2.extensions.cursor, release: list[_AwaitingRow], drop: list[_AwaitingRow]
+) -> None:
+    # Both statements match on the tag that was read, so a row that another run tagged after the
+    # read keeps that run's tag.
+    matched = """
+        queue.team_id = settled.team_id
+        AND queue.person_uuid = settled.person_uuid::uuid
+        AND queue.awaiting_delete_run = settled.awaiting_delete_run
+    """
+    if release:
+        execute_values(
+            cursor,
+            f"""
+            UPDATE {PG_CLEANUP_QUEUE_TABLE} AS queue SET awaiting_delete_run = NULL
+            FROM (VALUES %s) AS settled (awaiting_delete_run, team_id, person_uuid)
+            WHERE {matched}
+            """,
+            [(row.awaiting_delete_run, row.team_id, row.person_uuid) for row in release],
+            page_size=1000,
+        )
+    if drop:
+        execute_values(
+            cursor,
+            f"""
+            DELETE FROM {PG_CLEANUP_QUEUE_TABLE} AS queue
+            USING (VALUES %s) AS settled (awaiting_delete_run, team_id, person_uuid)
+            WHERE {matched}
+            """,
+            [(row.awaiting_delete_run, row.team_id, row.person_uuid) for row in drop],
+            page_size=1000,
+        )
+
+
+def _settle_abandoned_rows(
+    cluster: ClickhouseCluster, connection: psycopg2.extensions.connection, run: CleanupRun
+) -> _SettledRows:
+    released = 0
+    dropped = 0
+    conflict_retries = 0
+    after: _AwaitingRow | None = None
+    with connection.cursor() as cursor:
+        while True:
+            page = _read_abandoned_page(cursor, run.persons.run_id, after)
+            if not page:
+                break
+            by_host = cluster.map_hosts_by_role(
+                partial(_persons_in_clickhouse, rows=page, settings=run.query_settings), NodeRole.DATA
+            ).result()
+            present = set().union(*by_host.values())
+            release = [row for row in page if (row.team_id, row.person_uuid) not in present]
+            drop = [row for row in page if (row.team_id, row.person_uuid) in present]
+            conflict_retries += _retry_queue_conflicts(connection, partial(_apply_settlement, cursor, release, drop))
+            connection.commit()
+            released += len(release)
+            dropped += len(drop)
+            if len(page) < ABANDONED_ROWS_PAGE_SIZE:
+                break
+            after = page[-1]
+    return _SettledRows(released=released, dropped=dropped, conflict_retries=conflict_retries)
+
+
+@dagster.op(retry_policy=QUEUE_OP_RETRY_POLICY)
+def queue_persons_before_delete(
+    context: dagster.OpExecutionContext,
+    cluster: dagster.ResourceParam[ClickhouseCluster],
+    persons_database_url: dagster.ResourceParam[str],
+    run: CleanupRun,
+) -> CleanupRun:
+    """Queue the persons that delete_persons is about to remove, held back from the drain.
+
+    Each row names this run in awaiting_delete_run, and the drain skips such rows until
+    persist_deleted_persons clears the name after the delete. The rows go in before the delete
+    because a run that fails after its delete must still have queued every person it removed: no
+    later snapshot can find a person that ClickHouse no longer holds.
+
+    First this op settles the rows that an earlier, failed run left held back. A person that no
+    data host still holds was deleted, so its row is released to the drain. A person that any host
+    still holds has its row dropped. Releasing that row would let the drain remove the Postgres
+    person under a surviving ClickHouse tombstone, and a later snapshot queues the person again.
+    """
+    if run.dry_run:
+        context.log.info("dry run: skipping the write to %s", PG_CLEANUP_QUEUE_TABLE)
+        return run
+
+    # A run re-executed from this op skips the first op's wait.
+    wait_for_drain_to_stop(context)
+    connection = _connect_to_queue(persons_database_url)
+    try:
+        settled = _settle_abandoned_rows(cluster, connection, run)
+        held = _queue_run_persons(cluster, connection, run, awaiting_delete_run=run.persons.run_id)
+    finally:
+        connection.close()
+
+    conflict_retries = settled.conflict_retries + held.conflict_retries
+    context.add_output_metadata(
+        {
+            "abandoned_queue_rows_released": dagster.MetadataValue.int(settled.released),
+            "abandoned_queue_rows_dropped": dagster.MetadataValue.int(settled.dropped),
+            "held_for_delete": dagster.MetadataValue.int(held.persons),
+            "pg_queue_conflict_retries": dagster.MetadataValue.int(conflict_retries),
+        }
+    )
+    return replace(
+        run,
+        abandoned_queue_rows_released=settled.released,
+        abandoned_queue_rows_dropped=settled.dropped,
+        pg_queue_conflict_retries=run.pg_queue_conflict_retries + conflict_retries,
+    )
+
+
+@dagster.op(retry_policy=QUEUE_OP_RETRY_POLICY)
 def persist_deleted_persons(
     context: dagster.OpExecutionContext,
     cluster: dagster.ResourceParam[ClickhouseCluster],
     persons_database_url: dagster.ResourceParam[str],
     run: CleanupRun,
 ) -> CleanupRun:
-    """Hand the persons that delete_persons removed from ClickHouse to Postgres.
+    """Release the persons that delete_persons removed from ClickHouse to the drain.
 
-    This op runs after that delete, so the drain never removes a Postgres person whose
-    ClickHouse rows are still there. If this op fails, those persons stay in Postgres until the
-    run is re-executed from this op, which works only while the snapshot is inside its TTL.
+    queue_persons_before_delete already queued them, held back. This op runs after the delete, so
+    the drain never removes a Postgres person whose ClickHouse rows are still there. It upserts the
+    whole set again rather than clearing this run's name from the rows that still carry it: a later
+    sweep can drop this run's rows while settling them, and a re-execution from delete_persons must
+    still queue every person it removed. If this op fails, the rows stay held back until the next
+    sweep releases them.
 
     The queue is advisory, never authoritative. Rows sit here until the drain runs, so a person
     can be revived after being queued no matter how carefully this op checks. ClickHouse also
@@ -1280,82 +1575,23 @@ def persist_deleted_persons(
 
     # A run re-executed from this op skips the first op's wait.
     wait_for_drain_to_stop(context)
-    # Connected here rather than at resource init: a connect failure at init happens before the
-    # step exists, so no failure hook runs and the run's dictionaries are stranded. Failing
-    # inside the op is a step failure, which is what lets drop_assets_on_failure fire. It also
-    # keeps a dry run from dialing Postgres at all.
-    persons_database = psycopg2.connect(persons_database_url, connect_timeout=10)
-
-    def read_page(client: Client, after: tuple[int, str] | None) -> list[tuple[int, str]]:
-        # Reads the snapshot directly rather than the dictionary's query, so adding attributes to
-        # the dictionary cannot silently change the shape of what gets queued. Keyset pagination
-        # over (team_id, person_id) follows the table's sort key, and DISTINCT collapses the
-        # duplicate versions a retried snapshot insert can leave in the ReplacingMergeTree.
-        page_filter = "AND (team_id, person_id) > (%(after_team)s, toUUID(%(after_person)s))" if after else ""
-        return client.execute(
-            f"""
-            SELECT DISTINCT team_id, person_id FROM {run.persons.qualified_name}
-            WHERE run_id = %(run_id)s
-              AND (team_id, person_id) NOT IN ({run.revived.run_keys_query})
-              {page_filter}
-            ORDER BY team_id, person_id
-            LIMIT %(limit)s
-            """,
-            {
-                "run_id": run.persons.run_id,
-                "limit": PERSIST_PAGE_SIZE,
-                "after_team": after[0] if after else 0,
-                "after_person": after[1] if after else "",
-            },
-            settings=run.query_settings,
-        )
-
-    deleted_at = run.distinct_ids_deleted_at
-    written = 0
-    conflict_retries = 0
-    after: tuple[int, str] | None = None
+    connection = _connect_to_queue(persons_database_url)
     try:
-        with persons_database.cursor() as cursor:
-            cursor.execute("SET application_name = 'clickhouse_cleanup'")
-            # Bounded so a lock conflict on the queue fails the page instead of holding a transaction
-            # open on the persons writer; the per-page upsert is idempotent, so a retry is safe.
-            cursor.execute("SET statement_timeout = '120s'")
-            cursor.execute("SET lock_timeout = '10s'")
-            # SET is transactional, so without this commit a retry's rollback reverts all three.
-            # The role's own lock_timeout is 0, which would leave the next conflict unbounded.
-            persons_database.commit()
-            while True:
-                page = cluster.any_host_by_role(partial(read_page, after=after), NodeRole.DATA).result()
-                if not page:
-                    break
-                # A row still pending from an earlier sweep takes this run's deleted_at, and if the drain
-                # had marked it blocked (tombstoned person still owning a live distinct id) the block is
-                # lifted, because a fresh ClickHouse tombstone is new evidence the drain should act on.
-                # The WHERE keeps a retried op from rewriting rows that already hold this run's
-                # deleted_at: an unconditional DO UPDATE writes a new tuple version per row, so a retry
-                # over millions of rows would leave that many dead tuples for the persons writer to
-                # vacuum.
-                conflict_retries += _write_queue_page(persons_database, cursor, page, deleted_at)
-                # The conflict guard makes rowcount "rows changed", not "rows queued"; the metric is
-                # the queued set, which is the page.
-                written += len(page)
-                # Commit per page: the upsert makes replays idempotent, and one transaction across
-                # millions of rows would hold WAL and xmin on the persons writer for the whole op.
-                persons_database.commit()
-                if len(page) < PERSIST_PAGE_SIZE:
-                    break
-                last_team, last_person = page[-1]
-                after = (last_team, str(last_person))
+        queued = _queue_run_persons(cluster, connection, run, awaiting_delete_run=None)
     finally:
-        persons_database.close()
+        connection.close()
 
     context.add_output_metadata(
         {
-            "queued_for_postgres": dagster.MetadataValue.int(written),
-            "pg_queue_conflict_retries": dagster.MetadataValue.int(conflict_retries),
+            "queued_for_postgres": dagster.MetadataValue.int(queued.persons),
+            "pg_queue_conflict_retries": dagster.MetadataValue.int(queued.conflict_retries),
         }
     )
-    return replace(run, queued_for_postgres=written, pg_queue_conflict_retries=conflict_retries)
+    return replace(
+        run,
+        queued_for_postgres=queued.persons,
+        pg_queue_conflict_retries=run.pg_queue_conflict_retries + queued.conflict_retries,
+    )
 
 
 @dagster.op
@@ -1444,6 +1680,16 @@ def _sweep_gauges(run: CleanupRun, completed_at: float) -> list[PublishedGauge]:
             name="posthog_clickhouse_deletion_sweep_queued_for_postgres",
             help_text="Persons handed to the Postgres cleanup queue by this run",
             value=run.queued_for_postgres,
+        ),
+        PublishedGauge(
+            name="posthog_clickhouse_deletion_sweep_abandoned_queue_rows_released",
+            help_text="Held-back queue rows of an earlier failed run, released because ClickHouse lost the person",
+            value=run.abandoned_queue_rows_released,
+        ),
+        PublishedGauge(
+            name="posthog_clickhouse_deletion_sweep_abandoned_queue_rows_dropped",
+            help_text="Held-back queue rows of an earlier failed run, dropped because ClickHouse still holds the person",
+            value=run.abandoned_queue_rows_dropped,
         ),
         PublishedGauge(
             name="posthog_clickhouse_deletion_sweep_mutation_seconds_max",
@@ -1610,7 +1856,7 @@ def drop_assets_on_failure(context: dagster.HookContext) -> None:
     the tables' TTL reaps them, so a failed sweep stays inspectable in the meantime.
 
     A failed persist_deleted_persons is counted. The persons its run deleted from ClickHouse stay
-    in Postgres until a re-execution from that op, and no later snapshot can find them.
+    held back in the queue until the next sweep releases them.
     """
     if context.step_key == persist_deleted_persons.name:
         _emit(MetricsClient(context.resources.cluster), "clickhouse_cleanup_persist_failed", {})
@@ -1643,10 +1889,11 @@ def clickhouse_deletion_sweep_job():
     # deleted. Checking again between them would let a revival spare a person in ClickHouse
     # while its row was still queued, and the Postgres drain would then clear a live person.
     run = recheck_revived_persons("recheck_before_person_delete")(run)
-    run = delete_persons(run)
+    run = delete_persons(queue_persons_before_delete(run))
 
     # Each op takes the previous op's output, which is what keeps the sweeps in sequence. The
-    # handoff follows the delete, so the drain never removes a person that ClickHouse still holds.
+    # queued rows become drainable only after the delete, so the drain never removes a person
+    # that ClickHouse still holds.
     drop_snapshot_assets(publish_sweep_metrics(persist_deleted_persons(run)))
 
 
