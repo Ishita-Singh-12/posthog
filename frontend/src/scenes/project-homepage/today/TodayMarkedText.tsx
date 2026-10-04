@@ -46,8 +46,8 @@ export function TodayMarkedText({
     marked: TodayMarkedFigure[]
     reportId: string
 }): JSX.Element {
-    const { keyClauses } = useValues(todayReportLogic({ reportId }))
-    const runs = markedRuns(markdown, marked, keyClauses[renderedText(markdown)] ?? [])
+    const { shownKeyClauses } = useValues(todayReportLogic({ reportId }))
+    const runs = markedRuns(markdown, marked, shownKeyClauses[renderedText(markdown)] ?? [])
     return (
         <>
             {runs.map(({ keyClause, pieces }) => {

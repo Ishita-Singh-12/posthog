@@ -66,7 +66,7 @@ describe('todayReportLogic', () => {
             .toNotHaveDispatchedActions([other])
     })
 
-    test('asks Jev once per mark while a request is in flight', async () => {
+    test('asks Jev once per mark while a request is in flight and hides the marks when the flag turns off', async () => {
         const report = makeReport({ actionability: 'immediately_actionable', status: SignalReportStatus.READY })
         const calls = { keyClauses: 0, figureMarks: 0 }
         useMocks({
@@ -100,5 +100,10 @@ describe('todayReportLogic', () => {
         await expectLogic(logic).toFinishAllListeners()
 
         expect(calls).toEqual({ keyClauses: 1, figureMarks: 1 })
+        expect(logic.values.shownKeyClauses).toEqual(logic.values.keyClauses)
+
+        featureFlagLogic.actions.setFeatureFlags([], {})
+        expect(logic.values.shownKeyClauses).toEqual({})
+        expect(logic.values.shownFigureMarks).toBeNull()
     })
 })

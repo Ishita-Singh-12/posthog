@@ -97,6 +97,8 @@ export interface todayReportLogicValues {
     reportState: BriefingItemStateEnumApi
     reportUrl: string
     shownEvidence: SignalViewApi[]
+    shownFigureMarks: FigureMarkApi[] | null
+    shownKeyClauses: Record<string, KeyClauseApi[]>
     signals: SignalViewApi[]
     staleFiguresDate: string | null
 }
@@ -267,6 +269,11 @@ export interface todayReportLogicMeta {
         asksJev: (featureFlags: FeatureFlagsSet, isSample: boolean) => boolean
         proposal: (page: ReportPageApi | null) => string
         impactText: (page: ReportPageApi | null, impactNumbers: TodayImpactNumber[]) => string
+        shownFigureMarks: (asksJev: boolean, figureMarks: FigureMarkApi[] | null) => FigureMarkApi[] | null
+        shownKeyClauses: (
+            asksJev: boolean,
+            keyClauses: Record<string, KeyClauseApi[]>
+        ) => Record<string, KeyClauseApi[]>
         leadMarks: (lead: string, figureMarks: FigureMarkApi[] | null, signals: SignalViewApi[]) => TodayMarkedFigure[]
         impactMarks: (
             impactText: string,
@@ -460,13 +467,23 @@ export const todayReportLogic = kea<todayReportLogicType>([
             (page: ReportPageApi | null, impactNumbers: TodayImpactNumber[]): string =>
                 impactNumbers.length ? '' : (page?.impact_sentence ?? ''),
         ],
+        shownFigureMarks: [
+            (s) => [s.asksJev, s.figureMarks],
+            (asksJev: boolean, figureMarks: FigureMarkApi[] | null): FigureMarkApi[] | null =>
+                asksJev ? figureMarks : null,
+        ],
+        shownKeyClauses: [
+            (s) => [s.asksJev, s.keyClauses],
+            (asksJev: boolean, keyClauses: Record<string, KeyClauseApi[]>): Record<string, KeyClauseApi[]> =>
+                asksJev ? keyClauses : {},
+        ],
         leadMarks: [
-            (s) => [s.lead, s.figureMarks, s.signals],
+            (s) => [s.lead, s.shownFigureMarks, s.signals],
             (lead: string, figureMarks: FigureMarkApi[] | null, signals: SignalViewApi[]): TodayMarkedFigure[] =>
                 markedFigures(lead, marksIn(figureMarks, 'lead'), signals),
         ],
         impactMarks: [
-            (s) => [s.impactText, s.figureMarks, s.signals],
+            (s) => [s.impactText, s.shownFigureMarks, s.signals],
             (impactText: string, figureMarks: FigureMarkApi[] | null, signals: SignalViewApi[]): TodayMarkedFigure[] =>
                 markedFigures(impactText, marksIn(figureMarks, 'impact'), signals),
         ],
