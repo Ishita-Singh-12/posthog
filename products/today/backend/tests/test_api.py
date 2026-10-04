@@ -47,8 +47,13 @@ class TestTodayAPI(TodayTeamScopedTestMixin, APIBaseTest):
         self.organization.is_ai_data_processing_approved = True
         self.organization.save()
 
-    def _flag(self, enabled: bool):
-        return patch("products.today.backend.feature_flags.feature_enabled_or_false", return_value=enabled)
+    def _flag(self, enabled: bool | frozenset[str]):
+        if isinstance(enabled, bool):
+            return patch("products.today.backend.feature_flags.feature_enabled_or_false", return_value=enabled)
+        return patch(
+            "products.today.backend.feature_flags.feature_enabled_or_false",
+            side_effect=lambda flag, *args, **kwargs: flag in enabled,
+        )
 
     @parameterized.expand(
         [
@@ -180,6 +185,13 @@ class TestTodayAPI(TodayTeamScopedTestMixin, APIBaseTest):
         [
             ("flag on", True, REPORT_ID, None, status.HTTP_200_OK),
             ("flag off", False, REPORT_ID, None, status.HTTP_404_NOT_FOUND),
+            (
+                "the jev flag without the new navigation",
+                frozenset({"today-report-jev"}),
+                REPORT_ID,
+                None,
+                status.HTTP_404_NOT_FOUND,
+            ),
             ("not a report id", True, "report-1", None, status.HTTP_404_NOT_FOUND),
             ("no gateway", True, REPORT_ID, SystemOneNotConfigured("no gateway"), status.HTTP_503_SERVICE_UNAVAILABLE),
             (
@@ -195,7 +207,7 @@ class TestTodayAPI(TodayTeamScopedTestMixin, APIBaseTest):
         self,
         _sync_connect: MagicMock,
         _name: str,
-        flag: bool,
+        flag: bool | frozenset[str],
         report_id: str,
         gateway_error: Exception | None,
         expected: int,
@@ -250,7 +262,6 @@ class TestTodayAPI(TodayTeamScopedTestMixin, APIBaseTest):
             type="signal_finding",
             content=json.dumps({"data_queried": FIGURE_SOURCE}),
             created_at=WRITTEN_AT,
-            written_by_person=False,
         )
         page = replace(
             page_source(),
@@ -261,7 +272,7 @@ class TestTodayAPI(TodayTeamScopedTestMixin, APIBaseTest):
             self._flag(flag),
             patch("products.today.backend.facade.api.signals.report_page_source", return_value=page),
             patch(
-                "products.today.backend.facade.api.signals.report_artefact_texts",
+                "products.today.backend.facade.api.signals.report_agent_texts",
                 return_value=[finding] if source_kind == "research" else [],
             ),
             patch(

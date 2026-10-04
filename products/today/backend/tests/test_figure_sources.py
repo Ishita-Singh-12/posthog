@@ -6,6 +6,7 @@ from products.today.backend.facade.enums import FigureText
 from products.today.backend.logic.figure_sources import (
     KIND_LABELS,
     KIND_QUESTION,
+    NAMED_LABELS,
     NAMED_QUESTION,
     RELATION_QUESTION,
     SOURCE_QUESTION,
@@ -38,6 +39,14 @@ class TestFigureSources(SimpleTestCase):
                 [],
             ),
             (
+                "never marks a scaled zero or a zero range",
+                "The scanner saw 0K sessions and 0–0 errors.",
+                ["The scanner saw 0K sessions and 0–0 errors."],
+                {},
+                [],
+                [],
+            ),
+            (
                 "drops the mark when Jev does not read the number as a measured result",
                 "The export failed for 212 users.",
                 ["On Monday the export failed for 212 users."],
@@ -58,6 +67,14 @@ class TestFigureSources(SimpleTestCase):
                 "The export failed for 212 users.",
                 ["Result: 212."],
                 {NAMED_QUESTION: JevPick(label=UNNAMED, probability=SURE)},
+                [],
+                ALL_QUESTIONS,
+            ),
+            (
+                "drops the mark when Jev is unsure the source says what the number counts",
+                "The export failed for 212 users.",
+                ["On Monday the export failed for 212 users."],
+                {NAMED_QUESTION: JevPick(label=NAMED_LABELS[0], probability=0.6)},
                 [],
                 ALL_QUESTIONS,
             ),

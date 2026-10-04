@@ -82,5 +82,5 @@ def report_figure_marks(*, team: Team, user: User, report_id: str) -> list[contr
     page = signals.report_page_source(team=team, report_id=report_id)
     if page is None:
         return None
-    artefacts = signals.report_artefact_texts(team=team, report_id=report_id, types=figure_sources.RESEARCH_TYPES)
+    artefacts = signals.report_agent_texts(team=team, report_id=report_id, types=figure_sources.RESEARCH_TYPES)
     return report_pages.figure_marks(page, artefacts, _jev(team, user, figure_sources.FIGURE_MODEL))

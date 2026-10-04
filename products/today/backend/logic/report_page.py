@@ -10,7 +10,7 @@ from . import evidence, figure_sources, impact, samples
 from .formats import digits_end, github_links, is_word_char, utf16_offset
 from .jev import JevClient
 from .prose import concise_text
-from .report_text import MARKDOWN, rendered_text
+from .report_text import MARKDOWN, rendered_prose, rendered_text
 
 _PROPOSAL_CHARS = 260
 _IMPACT_CHARS = 180
@@ -106,12 +106,11 @@ def _figure_quote(candidate: figure_sources.Candidate) -> contracts.FigureQuote:
 def figure_marks(
     page: signals.ReportPageSource, artefacts: list[signals.ReportArtefactText], jev: JevClient
 ) -> list[contracts.FigureMark]:
-    texts = {
-        FigureText.LEAD: rendered_text(page.sections.lead),
-        FigureText.IMPACT: rendered_text(impact_sentence(page.sections.impact)),
-    }
+    markdowns = {FigureText.LEAD: page.sections.lead, FigureText.IMPACT: impact_sentence(page.sections.impact)}
+    texts = {name: rendered_text(markdown) for name, markdown in markdowns.items()}
+    prose = {name: rendered_prose(markdown) for name, markdown in markdowns.items()}
     notes = figure_sources.research_notes(artefacts)
-    matches = figure_sources.match_figures(texts, page.signals, notes, jev)
+    matches = figure_sources.match_figures(texts, page.signals, notes, jev, prose)
     return [
         contracts.FigureMark(
             text=match.claim.text_name,

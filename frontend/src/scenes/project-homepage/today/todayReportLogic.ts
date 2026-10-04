@@ -147,6 +147,9 @@ export interface todayReportLogicActions {
     codeQuoteCleared: (signalId: string) => {
         signalId: string
     }
+    codeQuotePicksCleared: () => {
+        value: true
+    }
     codeQuoteRead: (
         signalId: string,
         quote: TodayCodeQuoteState
@@ -326,6 +329,7 @@ export const todayReportLogic = kea<todayReportLogicType>([
         readCode: (signal: SignalViewApi, files: CodeFileApi[]) => ({ signal, files }),
         codeQuoteRead: (signalId: string, quote: TodayCodeQuoteState) => ({ signalId, quote }),
         codeQuoteCleared: (signalId: string) => ({ signalId }),
+        codeQuotePicksCleared: true,
         loadKeyClauses: true,
         askAboutReport: (question: string) => ({ question }),
         keyClausesLoaded: (found: Record<string, KeyClauseApi[]>) => ({ found }),
@@ -401,6 +405,13 @@ export const todayReportLogic = kea<todayReportLogicType>([
                     const { [signalId]: _, ...rest } = state
                     return rest
                 },
+                codeQuotePicksCleared: (state) =>
+                    Object.fromEntries(
+                        Object.entries(state).map(([signalId, quote]) => [
+                            signalId,
+                            quote && quote !== 'loading' ? { ...quote, ...quote.candidates[0] } : quote,
+                        ])
+                    ),
             },
         ],
         keyClauses: [
@@ -545,6 +556,9 @@ export const todayReportLogic = kea<todayReportLogicType>([
             [featureFlagLogic.actionTypes.setFeatureFlags]: () => {
                 actions.loadKeyClauses()
                 actions.loadFigureMarks()
+                if (!values.asksJev) {
+                    actions.codeQuotePicksCleared()
+                }
             },
             loadKeyClauses: async () => {
                 const loaded = values.fullReport !== null && values.page !== null
@@ -589,7 +603,7 @@ export const todayReportLogic = kea<todayReportLogicType>([
                     finding: signal.content.slice(0, todayExcerptChoiceCreateBodyFindingMax),
                     excerpts,
                 }).catch(() => ({ index: null }))
-                const chosen = pick === null ? null : choices[pick]
+                const chosen = pick === null || !values.asksJev ? null : choices[pick]
                 actions.codeQuoteRead(signal.signal_id, chosen ? { ...quote, ...chosen } : quote)
             },
             askAboutReport: ({ question }) => {

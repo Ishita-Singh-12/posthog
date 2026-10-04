@@ -74,6 +74,15 @@ class TestKeyClauses(SimpleTestCase):
                 [(FROZEN_SPINNER, [SPINNER_EXPLAINED]), (CAUSE, [CAUSE_EXPLAINED])],
             ),
             (
+                "a less sure clause the report explains, over a surer one it does not",
+                {
+                    FROZEN_SPINNER: JevPick(label="problem", probability=0.95),
+                    EMPTY_CART: JevPick(label="problem", probability=0.8),
+                },
+                {EMPTY_CART: CART_EXPLAINED},
+                [(EMPTY_CART, [CART_EXPLAINED])],
+            ),
+            (
                 "only a clause the report explains",
                 {
                     FROZEN_SPINNER: JevPick(label="problem", probability=0.95),

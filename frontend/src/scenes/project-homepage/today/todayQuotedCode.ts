@@ -147,6 +147,8 @@ export function findCodeQuote(
     const best = perFile.reduce((chosen, candidates) =>
         distinctMarked(candidates[0].excerpt) > distinctMarked(chosen[0].excerpt) ? candidates : chosen
     )
-    const candidates = [...best, ...perFile.filter((own) => own !== best).flat()]
-    return { ...best[0], candidates }
+    const ordered = [best, ...perFile.filter((own) => own !== best)]
+    const depth = Math.max(...ordered.map((own) => own.length))
+    const candidates = Array.from({ length: depth }, (_, rank) => ordered.flatMap((own) => own[rank] ?? []))
+    return { ...best[0], candidates: candidates.flat() }
 }

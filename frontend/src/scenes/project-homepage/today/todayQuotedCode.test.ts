@@ -98,8 +98,13 @@ describe('todayQuotedCode', () => {
         expect(chosen?.file.path.split('/').pop() ?? null).toEqual(expected)
     })
 
-    test('offers the excerpts of every file that holds the quote', () => {
-        const quote = findCodeQuote([OWN, SIBLING], [SIBLING_READ, SIBLING_READ], ['CARDS_MAX = 120'])
-        expect(quote?.candidates.map((candidate) => candidate.file)).toEqual([OWN, SIBLING])
+    test('offers the excerpts of every file that holds the quote, taking turns between files', () => {
+        const twice = read(OWN.path, ['export const CARDS_MAX = 120', ...Array(12).fill(''), 'use(CARDS_MAX)'])
+        const quote = findCodeQuote([OWN, SIBLING], [twice, SIBLING_READ], ['CARDS_MAX'])
+        expect(quote?.candidates.map((candidate) => [candidate.file, candidate.excerpt.startLine])).toEqual([
+            [OWN, 1],
+            [SIBLING, 1],
+            [OWN, 14],
+        ])
     })
 })
