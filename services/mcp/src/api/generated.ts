@@ -41704,7 +41704,7 @@ export namespace Schemas {
       index: number | null;
     }
 
-    export interface ExcerptChoiceQuery {
+    export interface ExcerptChoiceRequest {
       /**
          * The finding the code excerpts should show.
          * @maxLength 6000
@@ -57998,7 +57998,8 @@ export namespace Schemas {
          */
       text: string;
       /**
-         * The roles to look for in this text: problem, cause or fix.
+         * The roles to look for in this text: problem, cause or fix. Repeated roles count once.
+         * @minItems 1
          * @maxItems 3
          */
       roles: KeyClauseRoleEnum[];
@@ -58016,7 +58017,7 @@ export namespace Schemas {
       texts: TextKeyClauses[];
     }
 
-    export interface KeyClausesQuery {
+    export interface KeyClausesRequest {
       /**
          * The texts to mark, at most 3.
          * @maxItems 3
