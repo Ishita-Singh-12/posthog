@@ -388,9 +388,8 @@ def test_queues_the_deleted_persons_for_postgres(cluster: ClickhouseCluster, per
 def test_a_failed_run_holds_its_persons_back_until_the_next_sweep_settles_them(
     cluster: ClickhouseCluster, persons_database, failing_op: str
 ):
-    # A drainable row ahead of a failed delete lets the drain remove a person that ClickHouse
-    # still holds. No row at all after a successful delete leaks the Postgres person for good,
-    # because no later snapshot can find it. The next sweep has to tell the two apart.
+    # A failed delete must leave the person held, and a failed persist must not lose it, because
+    # no later snapshot can find a person ClickHouse no longer holds.
     doomed = create_person(team_id=TEAM_ID, version=0, is_deleted=True)
     real_runner = clickhouse_cleanup.LightweightDeleteMutationRunner
     real_write = clickhouse_cleanup._write_queue_page

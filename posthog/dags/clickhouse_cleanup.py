@@ -81,8 +81,8 @@ DEFAULT_TEAM_BATCHES = 1
 # run leaves the rest queued.
 DEFAULT_MAX_COHORTS = 2_000
 
-# A row produced before a tombstone can still be on its way to ClickHouse. If it lands after the
-# delete, it is the only version left and the key comes back. A day bounds that delay with margin.
+# A row produced before a tombstone can still be in flight; landing after the delete, it revives the key.
+# A day bounds that delay with margin.
 DEFAULT_MIN_TOMBSTONE_AGE_SECONDS = 24 * 3600
 
 # Named here rather than imported, because the drain module imports this one.
@@ -598,10 +598,8 @@ def _create_dictionary(
 def wait_for_drain_to_stop(context: dagster.OpExecutionContext) -> None:
     """Block until no Postgres drain run executes, so the drain never runs while the sweep does.
 
-    The drain checks for an executing sweep before each page, request and retry, and stops when
-    it finds one, so the wait covers one attempt and the timeout covers a stuck drain. Each
-    side checks only after its own run has started, so whichever side checks second sees the
-    other. The sweep waits for a terminal status, so no drain request is still in flight.
+    Each side checks after its own run starts, so whichever checks second sees the other; the drain
+    stops before its next attempt, and a terminal status means no drain request is still in flight.
     """
     deadline = time.monotonic() + DRAIN_STOP_TIMEOUT_SECONDS
     while blockers := describe_runs(
@@ -1223,9 +1221,8 @@ PG_QUEUE_CONFLICT_CODES = frozenset({"55P03", "40P01"})
 PG_QUEUE_RETRY_WINDOW_SECONDS = 300.0
 PG_QUEUE_RETRY_BACKOFF_SECONDS = 1.0
 
-# Covers what the in-op conflict retry does not, such as a dropped connection. Both queue ops are
-# idempotent. Dagster fires the failure hook only after the last attempt, so the run keeps its
-# dictionaries while a retry is pending.
+# Covers what the in-op conflict retry does not, such as a dropped connection; both queue ops are idempotent.
+# The failure hook fires only after the last attempt, so the dictionaries survive a pending retry.
 QUEUE_OP_RETRY_POLICY = dagster.RetryPolicy(max_retries=3, delay=60, backoff=dagster.Backoff.EXPONENTIAL)
 
 
@@ -1289,10 +1286,8 @@ def _write_queue_page(
 
 
 def _connect_to_queue(persons_database_url: str) -> psycopg2.extensions.connection:
-    # Connected inside the ops rather than at resource init: a connect failure at init happens
-    # before the step exists, so no failure hook runs and the run's dictionaries are stranded.
-    # Failing inside the op is a step failure, which is what lets drop_assets_on_failure fire. It
-    # also keeps a dry run from dialing Postgres at all.
+    # Not at resource init: a connect failure there skips the failure hook and strands the run's dictionaries.
+    # It also keeps a dry run off Postgres.
     connection = psycopg2.connect(persons_database_url, connect_timeout=10)
     try:
         with connection.cursor() as cursor:
@@ -1507,15 +1502,9 @@ def queue_persons_before_delete(
 ) -> CleanupRun:
     """Queue the persons that delete_persons is about to remove, held back from the drain.
 
-    Each row names this run in awaiting_delete_run, and the drain skips such rows until
-    persist_deleted_persons clears the name after the delete. The rows go in before the delete
-    because a run that fails after its delete must still have queued every person it removed: no
-    later snapshot can find a person that ClickHouse no longer holds.
-
-    First this op settles the rows that an earlier, failed run left held back. A person that no
-    data host still holds was deleted, so its row is released to the drain. A person that any host
-    still holds has its row dropped. Releasing that row would let the drain remove the Postgres
-    person under a surviving ClickHouse tombstone, and a later snapshot queues the person again.
+    Queued before the delete, because no later snapshot can find a person that ClickHouse no longer holds.
+    Rows a failed run left held are settled first: released when no data host holds the person, dropped
+    otherwise, so the drain never removes a Postgres person under a surviving ClickHouse tombstone.
     """
     if run.dry_run:
         context.log.info("dry run: skipping the write to %s", PG_CLEANUP_QUEUE_TABLE)
@@ -1556,12 +1545,8 @@ def persist_deleted_persons(
 ) -> CleanupRun:
     """Release the persons that delete_persons removed from ClickHouse to the drain.
 
-    queue_persons_before_delete already queued them, held back. This op runs after the delete, so
-    the drain never removes a Postgres person whose ClickHouse rows are still there. It upserts the
-    whole set again rather than clearing this run's name from the rows that still carry it: a later
-    sweep can drop this run's rows while settling them, and a re-execution from delete_persons must
-    still queue every person it removed. If this op fails, the rows stay held back until the next
-    sweep releases them.
+    It upserts the whole set rather than clearing this run's tag, because a later sweep can drop this run's
+    rows while settling them; if it fails, the rows stay held until the next sweep settles them.
 
     The queue is advisory, never authoritative. Rows sit here until the drain runs, so a person
     can be revived after being queued no matter how carefully this op checks. ClickHouse also
@@ -1855,8 +1840,7 @@ def drop_assets_on_failure(context: dagster.HookContext) -> None:
     The failed run's rows are left behind deliberately. They cost far less than a dictionary and
     the tables' TTL reaps them, so a failed sweep stays inspectable in the meantime.
 
-    A failed persist_deleted_persons is counted. The persons its run deleted from ClickHouse stay
-    held back in the queue until the next sweep releases them.
+    A failed persist_deleted_persons is counted; its persons stay held until the next sweep settles them.
     """
     if context.step_key == persist_deleted_persons.name:
         _emit(MetricsClient(context.resources.cluster), "clickhouse_cleanup_persist_failed", {})

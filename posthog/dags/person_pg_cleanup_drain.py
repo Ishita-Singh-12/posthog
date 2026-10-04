@@ -1,9 +1,8 @@
 """Drain person_pg_cleanup_queue into Postgres hard deletes.
 
 The ClickHouse sweep (clickhouse_cleanup.py) removes a deleted person's rows from ClickHouse and
-queues the person here. The sweep writes each row before its delete with awaiting_delete_run set,
-and clears it after the delete. The drain reads only rows where it is NULL, because ClickHouse can
-still hold the person of any other row. Postgres still holds the tombstoned posthog_person row and its dependent
+queues the person here. The drain reads only rows with a NULL awaiting_delete_run, which the sweep
+sets until its ClickHouse delete lands. Postgres still holds the tombstoned posthog_person row and its dependent
 rows (distinct ids, hash key overrides, cohort memberships) until this job asks personhog to
 delete them.
 
@@ -23,9 +22,8 @@ max_blocked. The one state the job parks is a tombstoned person that still owns 
 id: personhog reports it as blocked, and its row is stamped blocked_at and skipped for a retry
 interval, because ingestion can still reach that person and no delete may resolve it.
 
-The drain and the sweep never run together. Before each page, request and retry the drain checks
-for an executing sweep run and stops if it finds one, and the sweep waits for the drain to stop
-before it writes.
+The drain stops before each page, request and retry when a sweep executes, and the sweep waits for
+it to stop, so the two never run together.
 """
 
 import math
@@ -584,9 +582,8 @@ class _Drain:
     def yield_to_sweep(self) -> bool:
         """Stop when a sweep run executes, so the drain never runs while the sweep does.
 
-        The sweep waits for this run to finish before it touches anything, so stopping here
-        releases it. Rows not yet resolved stay queued for the next run. The check runs before
-        every page, request and retry, so the sweep waits for one attempt rather than a whole page.
+        Unresolved rows stay queued, and checking before every page, request and retry keeps the sweep's
+        wait to one attempt.
         """
         if self.totals.stopped_reason == "sweep_running":
             return True
