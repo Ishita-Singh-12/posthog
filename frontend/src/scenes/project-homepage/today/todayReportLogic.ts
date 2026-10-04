@@ -34,6 +34,7 @@ import {
     todayExcerptChoiceCreateBodyExcerptsItemMax,
     todayExcerptChoiceCreateBodyExcerptsMax,
     todayExcerptChoiceCreateBodyFindingMax,
+    todayReportsKeyClausesCreateBodyRequestsItemTextMax,
 } from 'products/today/frontend/generated/api.zod'
 
 import { reportItemState } from './todayBriefingItems'
@@ -482,7 +483,10 @@ export const todayReportLogic = kea<todayReportLogicType>([
                     { text: renderedText(lead), roles: ['problem', 'cause'] },
                     { text: renderedText(impactText), roles: ['problem', 'cause'] },
                     { text: renderedText(proposal), roles: ['fix'] },
-                ].filter((request): request is KeyClauseRequestApi => !!request.text),
+                ].filter(
+                    (request): request is KeyClauseRequestApi =>
+                        !!request.text && request.text.length <= todayReportsKeyClausesCreateBodyRequestsItemTextMax
+                ),
         ],
         reportUrl: [
             (s) => [s.currentTeamId],
@@ -556,17 +560,16 @@ export const todayReportLogic = kea<todayReportLogicType>([
                     actions.codeQuoteRead(signal.signal_id, quote)
                     return
                 }
-                const excerpts = quote.candidates
-                    .slice(0, todayExcerptChoiceCreateBodyExcerptsMax)
-                    .map((candidate) =>
-                        candidate.lines.join('\n').slice(0, todayExcerptChoiceCreateBodyExcerptsItemMax)
-                    )
+                const choices = quote.candidates.slice(0, todayExcerptChoiceCreateBodyExcerptsMax)
+                const excerpts = choices.map((candidate) =>
+                    candidate.excerpt.lines.join('\n').slice(0, todayExcerptChoiceCreateBodyExcerptsItemMax)
+                )
                 const { index: pick } = await todayExcerptChoiceCreate(String(values.currentProjectId), {
                     finding: signal.content.slice(0, todayExcerptChoiceCreateBodyFindingMax),
                     excerpts,
                 }).catch(() => ({ index: null }))
-                const excerpt = pick === null ? quote.excerpt : (quote.candidates[pick] ?? quote.excerpt)
-                actions.codeQuoteRead(signal.signal_id, { ...quote, excerpt })
+                const chosen = pick === null ? null : choices[pick]
+                actions.codeQuoteRead(signal.signal_id, chosen ? { ...quote, ...chosen } : quote)
             },
             askAboutReport: ({ question }) => {
                 const report = values.currentReport
