@@ -748,15 +748,14 @@ impl PersonLookup for PostgresStorage {
             .execute(&mut *tx)
             .await?;
 
-        // Resolved without locks. The delete re-checks the tombstone and the version bound under
-        // its row lock, so a person revived or tombstoned again in between drops out and reads as
-        // neither deleted nor skipped.
-        let tombstoned = sqlx::query!(
+        // One unlocked read classifies each uuid once. The delete re-checks the tombstone and the
+        // bound under its row lock, so a person revived or tombstoned again since reads as neither.
+        let persons = sqlx::query!(
             r#"
-            SELECT id::bigint AS "id!", uuid AS "uuid!",
+            SELECT id::bigint AS "id!", uuid AS "uuid!", is_deleted AS "is_deleted!",
                    COALESCE(version, 0)::bigint AS "version!"
             FROM posthog_person
-            WHERE team_id = $1 AND uuid = ANY($2) AND is_deleted
+            WHERE team_id = $1 AND uuid = ANY($2)
             ORDER BY id
             "#,
             team_id as i32,
@@ -764,30 +763,18 @@ impl PersonLookup for PostgresStorage {
         )
         .fetch_all(&mut *tx)
         .await?;
+        let mut skipped_live = 0;
         let mut skipped_version = 0;
-        let candidates: Vec<(i64, Uuid)> = tombstoned
-            .into_iter()
-            .filter_map(|row| {
-                if row.version > bound_of(&row.uuid) {
-                    skipped_version += 1;
-                    None
-                } else {
-                    Some((row.id, row.uuid))
-                }
-            })
-            .collect();
-
-        let skipped_live: i64 = sqlx::query_scalar!(
-            r#"
-            SELECT count(*) AS "count!"
-            FROM posthog_person
-            WHERE team_id = $1 AND uuid = ANY($2) AND is_deleted = false
-            "#,
-            team_id as i32,
-            unique.as_slice()
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let mut candidates: Vec<(i64, Uuid)> = Vec::with_capacity(persons.len());
+        for row in persons {
+            if !row.is_deleted {
+                skipped_live += 1;
+            } else if row.version > bound_of(&row.uuid) {
+                skipped_version += 1;
+            } else {
+                candidates.push((row.id, row.uuid));
+            }
+        }
 
         let mut outcome = TombstonedDeleteOutcome {
             skipped_live,
